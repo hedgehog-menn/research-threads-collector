@@ -317,8 +317,19 @@ class Collector:
         await self.page.goto(f"{BASE}/@{username}", wait_until="domcontentloaded")
         await self.page.wait_for_timeout(2500)
         try:
-            await self.page.get_by_role("button", name=re.compile(r"^more$", re.I)).first.click(timeout=6000)
-            await self.page.get_by_text(re.compile(r"About this profile", re.I)).first.click(timeout=6000)
+            # Several "More" buttons exist (the sidebar one opens Settings); try each until
+            # one opens a menu containing "About this profile".
+            about = self.page.get_by_text(re.compile(r"About this profile", re.I)).first
+            more = self.page.get_by_role("button", name=re.compile(r"^more$", re.I))
+            for i in range(await more.count()):
+                try:
+                    await more.nth(i).click(timeout=4000)
+                    await about.wait_for(timeout=2500)
+                    break
+                except Exception:
+                    await self.page.keyboard.press("Escape")
+                    await self.page.wait_for_timeout(500)
+            await about.click(timeout=6000)
             dialog = self.page.get_by_role("dialog").last
             await dialog.wait_for(timeout=8000)
             await self.page.wait_for_timeout(1500)
@@ -329,6 +340,8 @@ class Collector:
             return
         m = re.search(r"Based in\s*\n?\s*([^\n]+)", text, re.I)
         country = m.group(1).strip() if m else None
+        if country and country.lower() == "not shared":
+            country = None  # user hid it; distinguishable from "no Based in row" via country_raw
         self.store.set_country(username, country, text[:1000])
         print(f"[location] @{username}: {country or 'hidden/not shown'}")
 
