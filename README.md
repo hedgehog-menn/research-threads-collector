@@ -182,11 +182,11 @@ It needs no browser and can run at any time. Each run replaces the `post_feature
 
 ### Copy-paste clusters
 
-`features.py` also finds posts with the same or nearly the same text from different accounts, a basic coordination signal. Text is normalized first: links, @mentions, hashtags, punctuation, emoji and spacing are removed, and it is lowercased. Texts shorter than 40 characters are skipped. Two posts are grouped when their normalized texts are identical, or share at least 80% of their character 5-grams, which works for Thai and Khmer too.
+`features.py` also finds posts with the same or nearly the same text from different accounts, a basic coordination signal. Text is normalized first: links, @mentions, hashtags, punctuation, emoji and spacing are removed, and it is lowercased. Texts shorter than 40 characters are skipped. Two posts are grouped when their normalized texts are identical, or share at least 80% of their character 5-grams, which works for Thai and Khmer too. Near (non-identical) matches need at least 80 normalized characters in both posts, about 12–15 English words. Shorter posts only match exactly, since two short posts can look 80% similar just by sharing a slogan.
 
-- **`text_clusters`**: `n_posts`, `n_accounts`, `usernames`, `exact` (1 = identical after normalization), `first_at`, `last_at`, `span_hours`, `sample_text`
+- **`text_clusters`**: `n_posts`, `n_accounts`, `usernames`, `exact` (1 = identical after normalization), `first_at`, `last_at`, `span_hours`, `min_gap_s` and `median_gap_s` (the time between consecutive copies; seconds suggest an automated burst, hours suggest people copying a shared message), `sample_text`
 - **`post_text_clusters`**: `post_pk` → `cluster_id`
-- In `user_features`: `n_copy_posts` (the user's posts in clusters spanning 2+ accounts) and `n_copy_partners` (the other accounts they share copied text with)
+- In `user_features`: `n_copy_posts` (the user's posts in clusters spanning 2+ accounts), `n_copy_partners` (the other accounts they share copied text with) and `fastest_copy_gap_s` (their closest-in-time copy of another account's text)
 
 ```sql
 -- copied text across accounts, the most accounts first
@@ -195,6 +195,14 @@ FROM text_clusters WHERE n_accounts >= 2 ORDER BY n_accounts DESC, span_hours;
 ```
 
 A cluster only shows that the same text appeared; it doesn't show coordination by itself. Outlets reposting wire copy, or users sharing the same article title, cluster too.
+
+### Feature groups: coordination vs inauthenticity
+
+Meta's definition of coordinated *inauthentic* behavior depends on deception, meaning fake or misrepresented accounts. Real users in a national conflict often copy and paste a shared message on purpose ("share this"), so keep the two kinds of evidence as separate feature groups:
+
+- **Coordination** (what accounts do together): `text_clusters`, `n_copy_posts`, `n_copy_partners`, `fastest_copy_gap_s`, and later co-reply patterns
+- **Inauthenticity** (what an account is): `joined_month` and `account_age_months` (parsed from the "About this profile" text in `country_raw`, so only for location-checked users), `tz_margin` and `tz_quiet_share` (no rhythm or the wrong rhythm), `flag_tz_vs_country`, `flag_bio_vs_country`, and a "Based in" country that doesn't fit the activity
+- **Descriptive** (context, not evidence): `lang`, `top_lang`, `tz_offset`, `n_posts`
 
 ## Troubleshooting
 

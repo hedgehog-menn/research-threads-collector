@@ -34,7 +34,7 @@ from pathlib import Path
 import hanzidentifier as hz
 from lingua import LanguageDetectorBuilder
 
-FEATURES_VERSION = "2"
+FEATURES_VERSION = "3"
 
 MIN_LATIN_LETTERS = 12  # below this, Latin-script language detection is guesswork
 MIN_TZ_POSTS = 20       # posts needed to fit an active-hours offset
@@ -206,9 +206,27 @@ def bio_location(bio: str):
     return (best[1], best[2]) if best else (None, None)
 
 
+# ---------------------------------------------------------------- account age
+
+JOINED_RE = re.compile(r"Joined\s*\n?\s*([A-Z][a-z]+)\s+(\d{4})")
+MONTHS = {m: i for i, m in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July", "August",
+     "September", "October", "November", "December"], 1)}
+
+
+def joined_month(country_raw):
+    """'Joined April 2023' from the saved 'About this profile' text -> '2023-04'."""
+    m = JOINED_RE.search(country_raw or "")
+    if not m or m.group(1) not in MONTHS:
+        return None
+    return f"{m.group(2)}-{MONTHS[m.group(1)]:02d}"
+
+
 # ---------------------------------------------------------------- copy-paste clusters
 
 MIN_DUP_CHARS = 40     # normalized text shorter than this is too generic to call a copy
+NEAR_MIN_CHARS = 80    # below this (~12-15 English words) only EXACT copies count: short
+                       # posts can look "80% similar" just by sharing a slogan
 SHINGLE = 5            # character n-gram size; works for scripts without spaces too
 MAX_SHINGLE_DF = 200   # ignore n-grams this common when looking for candidate pairs
 MIN_SHARED = 8         # shared rare n-grams before a pair is compared in full
@@ -256,6 +274,8 @@ def text_clusters(posts):
                 for b in range(a + 1, len(ids)):
                     shared[(ids[a], ids[b])] += 1
     for (i, j), n in shared.items():
+        if min(len(norm[i][2]), len(norm[j][2])) < NEAR_MIN_CHARS:
+            continue
         if n >= MIN_SHARED and find(i) != find(j):
             if len(grams[i] & grams[j]) / len(grams[i] | grams[j]) >= DUP_JACCARD:
                 parent[find(i)] = find(j)
@@ -272,12 +292,17 @@ def text_clusters(posts):
         times = [r[3] for r in rows if r[3]]
         users = sorted({r[1] for r in rows})
         first = min(rows, key=lambda r: r[3] or 0)
+        gaps = [b - a for a, b in zip(sorted(times), sorted(times)[1:])]
         clusters.append({
             "cluster_id": pks[0], "post_pks": pks, "n_posts": len(rows),
             "n_accounts": len(users), "usernames": json.dumps(users, ensure_ascii=False),
             "exact": int(len({r[2] for r in rows}) == 1),
             "first_at": min(times) if times else None, "last_at": max(times) if times else None,
             "span_hours": round((max(times) - min(times)) / 3600, 2) if times else None,
+            # time between consecutive copies: seconds = bot-like burst, hours = people
+            # copying a shared message over time
+            "min_gap_s": min(gaps) if gaps else None,
+            "median_gap_s": statistics.median(gaps) if gaps else None,
             "first_post_pk": first[0],
         })
     return clusters
@@ -291,9 +316,15 @@ USER_COLS = ["user_pk", "username", "country", "n_posts", "top_lang", "top_lang_
              "n_trad_only", "n_simp_only", "simp_share", "tz_offset", "tz_margin",
              "tz_quiet_share", "tz_n_posts", "bio_country", "bio_term",
              "flag_bio_vs_country", "flag_tz_vs_country", "flag_simplified_in_taiwan",
-             "n_copy_posts", "n_copy_partners", "features_version", "computed_at"]
+             "n_copy_posts", "n_copy_partners", "fastest_copy_gap_s",
+             "joined_month", "account_age_months", "features_version", "computed_at"]
+# Feature groups (keep them apart when modelling - see README):
+#   coordination:    n_copy_posts, n_copy_partners, fastest_copy_gap_s (+ text_clusters)
+#   inauthenticity:  flag_*, tz_margin / tz_quiet_share, bio_country vs country,
+#                    joined_month / account_age_months
+#   descriptive:     lang, simp_share, tz_offset, n_posts
 CLUSTER_COLS = ["cluster_id", "n_posts", "n_accounts", "usernames", "exact", "first_at",
-                "last_at", "span_hours", "first_post_pk", "sample_text",
+                "last_at", "span_hours", "min_gap_s", "median_gap_s", "first_post_pk", "sample_text",
                 "features_version", "computed_at"]
 POST_CLUSTER_COLS = ["post_pk", "cluster_id"]
 
@@ -315,11 +346,20 @@ def build(db: sqlite3.Connection):
     text_of = {pk: t for pk, _, t, _, _ in posts}
     user_of = {pk: u for pk, _, _, _, u in posts}
     copy_posts, partners = Counter(), {}
+    time_of = {pk: ts for pk, _, _, ts, _ in posts}
+    fastest: dict[str, int] = {}
     for c in clusters:
         c.update(sample_text=(text_of[c["first_post_pk"]] or "")[:300],
                  features_version=FEATURES_VERSION, computed_at=t0)
         if c["n_accounts"] < 2:
             continue  # one account repeating itself is not cross-account copying
+        # per user: closest-in-time copy by ANOTHER account in the same cluster
+        for pk in c["post_pks"]:
+            u, t = user_of[pk], time_of[pk]
+            others = [time_of[q] for q in c["post_pks"] if user_of[q] != u and time_of[q] and t]
+            if others:
+                gap = min(abs(t - o) for o in others)
+                fastest[u] = min(gap, fastest.get(u, gap))
         users = json.loads(c["usernames"])
         for u in users:
             partners.setdefault(u, set()).update(x for x in users if x != u)
@@ -327,8 +367,8 @@ def build(db: sqlite3.Connection):
             copy_posts[user_of[pk]] += 1
 
     user_rows = []
-    for upk, username, country, bio in db.execute(
-        "SELECT pk, username, country, bio FROM users"
+    for upk, username, country, bio, country_raw in db.execute(
+        "SELECT pk, username, country, bio, country_raw FROM users"
     ):
         items = by_user.get(upk, [])
         langs = Counter(f["lang"] for _, f in items if f["lang"] != "und")
@@ -358,6 +398,11 @@ def build(db: sqlite3.Connection):
                 int(simp_share > 0.5) if country == "Taiwan" and simp_share is not None else None),
             "n_copy_posts": copy_posts.get(username, 0),
             "n_copy_partners": len(partners.get(username, ())),
+            "fastest_copy_gap_s": fastest.get(username),
+            "joined_month": (jm := joined_month(country_raw)),
+            "account_age_months": (
+                (time.gmtime(t0).tm_year - int(jm[:4])) * 12 + time.gmtime(t0).tm_mon - int(jm[5:])
+                if jm else None),
             "features_version": FEATURES_VERSION, "computed_at": t0,
         })
     post_clusters = [{"post_pk": pk, "cluster_id": c["cluster_id"]}
@@ -409,6 +454,7 @@ def main():
         vals = [u[flag] for u in user_rows if u[flag] is not None]
         print(f"  {flag}: {sum(vals)} of {len(vals)} checkable")
     multi = [c for c in clusters if c["n_accounts"] >= 2]
+    print(f"  users with join date: {sum(u['joined_month'] is not None for u in user_rows)}")
     print(f"  copy-paste clusters: {len(clusters)} ({len(multi)} spanning 2+ accounts, "
           f"{sum(c['n_posts'] for c in multi)} posts, "
           f"{sum(u['n_copy_posts'] > 0 for u in user_rows)} accounts involved)")
