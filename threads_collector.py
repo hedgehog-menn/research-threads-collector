@@ -18,6 +18,7 @@ Usage:
   python threads_collector.py search "election" --recent --scrolls 20
   python threads_collector.py location zuck mosseri          # "About this profile" country
   python threads_collector.py stats
+  python threads_collector.py reparse                        # refill columns from raw_json
 
 Add --dump-raw raw/ on the first runs to save the raw payloads so you can
 check the schema.
@@ -30,7 +31,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 from playwright.async_api import async_playwright
 
@@ -70,7 +71,18 @@ CREATE TABLE IF NOT EXISTS posts (
     url TEXT,
     source TEXT,
     first_scraped_at INTEGER,
-    raw_json TEXT
+    raw_json TEXT,
+    reshare_count INTEGER,
+    topic_tag TEXT,
+    media_type TEXT,
+    quoted_post_pk TEXT,
+    link_url TEXT,
+    root_post_username TEXT,
+    self_thread_pos INTEGER,
+    self_thread_length INTEGER,
+    is_edited INTEGER,
+    ai_label TEXT,
+    last_scraped_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_pk);
 CREATE INDEX IF NOT EXISTS idx_posts_root ON posts(thread_root_pk);
@@ -102,15 +114,75 @@ def as_int(v):
         return None
 
 
+# Columns added after the first release; Store adds them to older databases.
+POST_MIGRATIONS = {
+    "reshare_count": "INTEGER", "topic_tag": "TEXT", "media_type": "TEXT",
+    "quoted_post_pk": "TEXT", "link_url": "TEXT", "root_post_username": "TEXT",
+    "self_thread_pos": "INTEGER", "self_thread_length": "INTEGER", "is_edited": "INTEGER",
+    "ai_label": "TEXT", "last_scraped_at": "INTEGER",
+}
+
+MEDIA_TYPES = {1: "image", 2: "video", 8: "carousel", 19: "text"}
+
+
+def unwrap_link(url):
+    """Threads wraps outbound links as l.threads.com/?u=<real url>; return the real one."""
+    if url and urlparse(url).netloc == "l.threads.com":
+        return parse_qs(urlparse(url).query).get("u", [url])[0]
+    return url
+
+
+def post_fields(p: dict) -> dict:
+    """Map a raw post dict to the posts-table columns derived from it."""
+    user = p.get("user") or {}
+    tpi = p.get("text_post_app_info") or {}
+    share = tpi.get("share_info") or {}
+    stinfo = tpi.get("self_thread_info") or {}
+    cap = p.get("caption")
+    reply_to = (tpi.get("reply_to_author") or {}).get("username")
+    username, code = user.get("username"), p.get("code")
+    mt = as_int(p.get("media_type"))
+    quoted = share.get("quoted_post")
+    return {
+        "code": code,
+        "user_pk": str(user.get("pk") or user.get("id") or ""),
+        "username": username,
+        "text": cap.get("text") if isinstance(cap, dict) else (cap or ""),
+        "taken_at": as_int(p.get("taken_at")),
+        "like_count": as_int(p.get("like_count")),
+        "reply_count": as_int(tpi.get("direct_reply_count")),
+        "repost_count": as_int(tpi.get("repost_count")),
+        "quote_count": as_int(tpi.get("quote_count")),
+        "reshare_count": as_int(tpi.get("reshare_count")),
+        "is_reply": int(bool(reply_to or tpi.get("is_reply"))),
+        "reply_to_username": reply_to,
+        "root_post_username": (tpi.get("root_post_author") or {}).get("username"),
+        "url": f"{BASE}/@{username}/post/{code}" if code and username else None,
+        "topic_tag": (tpi.get("tag_header") or {}).get("display_name"),
+        "media_type": MEDIA_TYPES.get(mt, str(mt) if mt is not None else None),
+        "quoted_post_pk": str(quoted["pk"]) if isinstance(quoted, dict) and quoted.get("pk") else None,
+        "link_url": unwrap_link((tpi.get("link_preview_attachment") or {}).get("url")),
+        "self_thread_pos": as_int(stinfo.get("post_position_in_self_thread")),
+        "self_thread_length": as_int(stinfo.get("self_thread_length")),
+        "is_edited": as_int(p.get("caption_is_edited")),
+        "ai_label": (p.get("gen_ai_detection_method") or {}).get("detection_method"),
+    }
+
+
 # ---------------------------------------------------------------- storage
 
 class Store:
     def __init__(self, path: str, keep_raw: bool = True):
         self.db = sqlite3.connect(path)
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(posts)")}
+        for col, typ in POST_MIGRATIONS.items():
+            if have and col not in have:
+                self.db.execute(f"ALTER TABLE posts ADD COLUMN {col} {typ}")
         self.db.executescript(SCHEMA)
         self.keep_raw = keep_raw
         self.thread_pos: dict[str, tuple[str, int]] = {}
         self.new_posts = 0
+        self.seen_posts = 0  # new + already-known posts; used to detect end of feed
 
     def upsert_user(self, u: dict):
         pk = str(u.get("pk") or u.get("id") or "")
@@ -133,53 +205,63 @@ class Store:
         )
 
     def add_post(self, p: dict, source: str):
-        user = p["user"]
-        self.upsert_user(user)
-
+        self.upsert_user(p["user"])
         pk = str(p.get("pk") or p.get("id")).split("_")[0]
-        tpi = p.get("text_post_info") or {}
-        cap = p.get("caption")
-        text = cap.get("text") if isinstance(cap, dict) else (cap or "")
-        reply_to = (tpi.get("reply_to_author") or {}).get("username")
-        username = user.get("username")
-        code = p.get("code")
+        f = post_fields(p)
         root, pos = self.thread_pos.get(pk, (None, None))
-        counts = (as_int(p.get("like_count")), as_int(tpi.get("direct_reply_count")),
-                  as_int(tpi.get("repost_count")), as_int(tpi.get("quote_count")))
         t = now()
+        row = {**f, "pk": pk, "thread_root_pk": root, "thread_pos": pos, "source": source,
+               "first_scraped_at": t, "last_scraped_at": t,
+               "raw_json": json.dumps(p, ensure_ascii=False) if self.keep_raw else None}
+        # On re-sight: refresh derived fields (keep old value if the new payload lacks it),
+        # but keep the original source, first_scraped_at and thread position.
+        keep = {"pk", "source", "first_scraped_at", "thread_root_pk", "thread_pos"}
+        updates = ",\n".join(
+            f"{c} = COALESCE(excluded.{c}, {c})" for c in row if c not in keep
+        )
+        updates += ",\n thread_root_pk = COALESCE(thread_root_pk, excluded.thread_root_pk)"
+        updates += ",\n thread_pos = COALESCE(thread_pos, excluded.thread_pos)"
 
         exists = self.db.execute("SELECT 1 FROM posts WHERE pk=?", (pk,)).fetchone()
+        cols = ", ".join(row)
         self.db.execute(
-            """INSERT INTO posts(pk, code, user_pk, username, text, taken_at,
-                                 like_count, reply_count, repost_count, quote_count,
-                                 is_reply, reply_to_username, thread_root_pk, thread_pos,
-                                 url, source, first_scraped_at, raw_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(pk) DO UPDATE SET
-                 like_count = COALESCE(excluded.like_count, like_count),
-                 reply_count = COALESCE(excluded.reply_count, reply_count),
-                 repost_count = COALESCE(excluded.repost_count, repost_count),
-                 quote_count = COALESCE(excluded.quote_count, quote_count),
-                 reply_to_username = COALESCE(excluded.reply_to_username, reply_to_username),
-                 thread_root_pk = COALESCE(thread_root_pk, excluded.thread_root_pk),
-                 thread_pos = COALESCE(thread_pos, excluded.thread_pos)""",
-            (pk, code, str(user.get("pk") or user.get("id") or ""), username, text,
-             as_int(p.get("taken_at")), *counts,
-             int(bool(reply_to or tpi.get("is_reply"))), reply_to, root, pos,
-             f"{BASE}/@{username}/post/{code}" if code and username else None,
-             source, t, json.dumps(p, ensure_ascii=False) if self.keep_raw else None),
+            f"INSERT INTO posts({cols}) VALUES ({','.join('?' * len(row))})"
+            f" ON CONFLICT(pk) DO UPDATE SET {updates}",
+            tuple(row.values()),
         )
         self.db.execute(
-            "INSERT INTO post_snapshots VALUES (?,?,?,?,?,?)", (pk, t, *counts)
+            "INSERT INTO post_snapshots VALUES (?,?,?,?,?,?)",
+            (pk, t, f["like_count"], f["reply_count"], f["repost_count"], f["quote_count"]),
         )
+        self.seen_posts += 1
         if not exists:
             self.new_posts += 1
 
+    def reparse(self) -> int:
+        """Re-derive post columns from stored raw_json (after parser fixes)."""
+        rows = self.db.execute("SELECT pk, raw_json FROM posts WHERE raw_json IS NOT NULL").fetchall()
+        for pk, raw in rows:
+            f = post_fields(json.loads(raw))
+            self.db.execute(
+                f"UPDATE posts SET {', '.join(f'{c}=?' for c in f)} WHERE pk=?",
+                (*f.values(), pk),
+            )
+        self.db.commit()
+        return len(rows)
+
     def set_country(self, username: str, country, raw):
-        self.db.execute(
-            "UPDATE users SET country=?, country_raw=?, country_checked_at=? WHERE username=?",
-            (country, raw, now(), username),
-        )
+        if raw.startswith("ui_error:"):  # failed lookup: keep any country found earlier
+            self.db.execute(
+                "UPDATE users SET country_checked_at=?,"
+                " country_raw = CASE WHEN country IS NULL THEN ? ELSE country_raw END"
+                " WHERE username=?",
+                (now(), raw, username),
+            )
+        else:
+            self.db.execute(
+                "UPDATE users SET country=?, country_raw=?, country_checked_at=? WHERE username=?",
+                (country, raw, now(), username),
+            )
         self.db.commit()
 
     def commit(self):
@@ -211,7 +293,7 @@ def is_post(d: dict) -> bool:
     return (
         isinstance(d.get("user"), dict)
         and "taken_at" in d
-        and ("caption" in d or "text_post_info" in d)
+        and ("caption" in d or "text_post_app_info" in d)
         and bool(d.get("pk") or d.get("id"))
     )
 
@@ -299,12 +381,12 @@ class Collector:
 
         idle = 0
         for _ in range(scrolls):
-            before = self.store.new_posts
+            before = self.store.seen_posts
             await self.page.mouse.wheel(0, random.randint(2500, 4500))
             await self.page.wait_for_timeout(random.uniform(1500, 3500))
             await self._drain()
-            idle = idle + 1 if self.store.new_posts == before else 0
-            if idle >= 3:  # no new posts after 3 scrolls -> end of feed or rate-limited
+            idle = idle + 1 if self.store.seen_posts == before else 0
+            if idle >= 3:  # nothing loaded after 3 scrolls -> end of feed or rate-limited
                 break
 
         await self._drain()
@@ -367,6 +449,7 @@ def build_args():
     p = sub.add_parser("search"); p.add_argument("query"); p.add_argument("--recent", action="store_true"); p.add_argument("--scrolls", type=int, default=20)
     p = sub.add_parser("location"); p.add_argument("usernames", nargs="+")
     sub.add_parser("stats")
+    sub.add_parser("reparse", help="re-derive post columns from stored raw_json")
     return ap.parse_args()
 
 
@@ -380,6 +463,10 @@ async def run(args):
             ("snapshots", "SELECT COUNT(*) FROM post_snapshots"),
         ]:
             print(f"{label:>20}: {db.execute(q).fetchone()[0]}")
+        return
+
+    if args.cmd == "reparse":
+        print(f"re-parsed {Store(args.db).reparse()} posts")
         return
 
     if args.dump_raw:

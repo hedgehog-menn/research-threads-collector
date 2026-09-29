@@ -37,6 +37,7 @@ python threads_collector.py search "climate policy" --recent    # search results
 python threads_collector.py post https://www.threads.com/@user/post/CODE   # a post and its replies
 python threads_collector.py location zuck mosseri               # "Based in" country from "About this profile"
 python threads_collector.py stats                               # row counts
+python threads_collector.py reparse                             # refill post columns from raw_json
 ```
 
 Global options go **before** the command, as in `python threads_collector.py --headful location zuck`:
@@ -45,7 +46,9 @@ Global options go **before** the command, as in `python threads_collector.py --h
 - `--dump-raw raw/` saves every raw payload so you can inspect the data format.
 - `--db`, `--auth` use a different database or session file.
 
-`+N new posts` counts only posts that weren't already in the database. Posts you've already collected still get fresh like and reply counts.
+`+N new posts` counts only posts that weren't already in the database. Posts you've already collected still get fresh counts and a new snapshot.
+
+Search loads about 3 results per scroll, so use a high `--scrolls` value (for example 60) to collect a useful number of posts.
 
 ### Looking up locations for everyone collected so far
 
@@ -59,7 +62,14 @@ Work in batches of about 100 and take breaks between them. Each lookup waits 4â€
 ## Database
 
 - **`users`**: `username`, `full_name`, `follower_count`, `bio`, `country`, `country_raw`, `country_checked_at`
-- **`posts`**: `text`, `taken_at` (unix time), like, reply, repost and quote counts, `is_reply`, `thread_root_pk`, `url`, `source` (which command found the post), `raw_json`
+- **`posts`**: one row per post
+  - `text`, `taken_at` (unix time), `url`, `username`, `user_pk`
+  - `like_count`, `reply_count`, `repost_count`, `quote_count`, `reshare_count`
+  - `is_reply`, `reply_to_username`, `root_post_username` (who started the conversation)
+  - `thread_root_pk`, `thread_pos`, plus `self_thread_pos` and `self_thread_length` for multi-post threads by one author
+  - `topic_tag` (such as "Tech Threads"), `media_type` (`text`, `image`, `video`, `carousel`, or a raw number code), `link_url`, `quoted_post_pk`, `is_edited`
+  - `ai_label`: Meta's "AI info" label source (`NONE`, `SELF_DISCLOSURE_FLOW`, `C2PA_METADATA`, `IPTC_METADATA`, or an `_EDITED` variant of the last two). It reflects disclosure or embedded metadata, not detection, so `NONE` does not mean the post isn't AI-made.
+  - `source` (which command first found the post), `first_scraped_at`, `last_scraped_at`, `raw_json` (the full original data)
 - **`post_snapshots`**: one row of engagement counts each time a post is seen, for tracking changes over time
 
 What `country` means: a country name, or `NULL`. For a checked user, `NULL` can mean any of three things, and `country_raw` (the text of the "About this profile" dialog) tells you which:
@@ -67,6 +77,8 @@ What `country` means: a country name, or `NULL`. For a checked user, `NULL` can 
 - it contains `Not shared`: the user hid their location
 - it starts with `ui_error:`: the lookup failed
 - otherwise: the profile has no "Based in" line, which seems to be the case for newer accounts
+
+If the parser changes, run `reparse` to rebuild the post columns from `raw_json` without collecting again. Older databases get the new columns added automatically.
 
 ### Useful queries
 

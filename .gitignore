@@ -1,4 +1,4 @@
 /raw
-/threads.db
+*.db
 /auth.json
 __pycache__/
