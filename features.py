@@ -34,7 +34,7 @@ from pathlib import Path
 import hanzidentifier as hz
 from lingua import LanguageDetectorBuilder
 
-FEATURES_VERSION = "3"
+FEATURES_VERSION = "4"
 
 MIN_LATIN_LETTERS = 12  # below this, Latin-script language detection is guesswork
 MIN_TZ_POSTS = 20       # posts needed to fit an active-hours offset
@@ -209,6 +209,12 @@ def bio_location(bio: str):
 # ---------------------------------------------------------------- account age
 
 JOINED_RE = re.compile(r"Joined\s*\n?\s*([A-Z][a-z]+)\s+(\d{4})")
+# "Joined April 2023 · #2": the Threads join date and signup number (zuck is #1). The number
+# rises with time, so it orders accounts within a month - useful because ~half of all
+# accounts show "July 2023" (the launch wave). Only the first 100 million accounts get a
+# number; later ones show "100M+". It is the Threads join, not Instagram's: no date
+# precedes the April 2023 internal test.
+SIGNUP_RE = re.compile(r"Joined[^#]{0,40}#\s*([\d,]+)")
 MONTHS = {m: i for i, m in enumerate(
     ["January", "February", "March", "April", "May", "June", "July", "August",
      "September", "October", "November", "December"], 1)}
@@ -220,6 +226,33 @@ def joined_month(country_raw):
     if not m or m.group(1) not in MONTHS:
         return None
     return f"{m.group(2)}-{MONTHS[m.group(1)]:02d}"
+
+
+def signup_number(country_raw):
+    """(signup number or None, over_100m): over_100m is 1 for "100M+", 0 when a number is
+    shown, None when there's no join line at all."""
+    m = SIGNUP_RE.search(country_raw or "")
+    if m:
+        return int(m.group(1).replace(",", "")), 0
+    if re.search(r"Joined[^\n]*\n?[^\n]*100M\+", country_raw or ""):
+        return None, 1
+    return None, None
+
+
+def month_index(ym: str) -> int:
+    return int(ym[:4]) * 12 + int(ym[5:7]) - 1
+
+
+def join_vs_topic(jm, topic):
+    """(months from joining to the next peak month, joined inside the study period).
+    Month precision only - that's all "Joined" gives."""
+    if not jm or not topic:
+        return None, None
+    j = month_index(jm)
+    ahead = [month_index(pk) - j for pk in topic.get("peaks", []) if month_index(pk) >= j]
+    per = topic.get("period")
+    inside = int(month_index(per["from"]) <= j <= month_index(per["to"])) if per else None
+    return (min(ahead) if ahead else None), inside
 
 
 # ---------------------------------------------------------------- copy-paste clusters
@@ -317,11 +350,13 @@ USER_COLS = ["user_pk", "username", "country", "n_posts", "top_lang", "top_lang_
              "tz_quiet_share", "tz_n_posts", "bio_country", "bio_term",
              "flag_bio_vs_country", "flag_tz_vs_country", "flag_simplified_in_taiwan",
              "n_copy_posts", "n_copy_partners", "fastest_copy_gap_s",
-             "joined_month", "account_age_months", "features_version", "computed_at"]
+             "joined_month", "account_age_months", "signup_number", "signup_over_100m",
+             "months_join_to_next_peak", "joined_in_period", "features_version", "computed_at"]
 # Feature groups (keep them apart when modelling - see README):
 #   coordination:    n_copy_posts, n_copy_partners, fastest_copy_gap_s (+ text_clusters)
 #   inauthenticity:  flag_*, tz_margin / tz_quiet_share, bio_country vs country,
-#                    joined_month / account_age_months
+#                    joined_month / account_age_months / signup_number,
+#                    months_join_to_next_peak / joined_in_period (need --topic)
 #   descriptive:     lang, simp_share, tz_offset, n_posts
 CLUSTER_COLS = ["cluster_id", "n_posts", "n_accounts", "usernames", "exact", "first_at",
                 "last_at", "span_hours", "min_gap_s", "median_gap_s", "first_post_pk", "sample_text",
@@ -329,7 +364,7 @@ CLUSTER_COLS = ["cluster_id", "n_posts", "n_accounts", "usernames", "exact", "fi
 POST_CLUSTER_COLS = ["post_pk", "cluster_id"]
 
 
-def build(db: sqlite3.Connection):
+def build(db: sqlite3.Connection, topic: dict | None = None):
     t0 = int(time.time())
     pa = PostAnalyzer()
     posts = db.execute("SELECT pk, user_pk, text, taken_at, username FROM posts").fetchall()
@@ -400,6 +435,10 @@ def build(db: sqlite3.Connection):
             "n_copy_partners": len(partners.get(username, ())),
             "fastest_copy_gap_s": fastest.get(username),
             "joined_month": (jm := joined_month(country_raw)),
+            "signup_number": signup_number(country_raw)[0],
+            "signup_over_100m": signup_number(country_raw)[1],
+            "months_join_to_next_peak": join_vs_topic(jm, topic)[0],
+            "joined_in_period": join_vs_topic(jm, topic)[1],
             "account_age_months": (
                 (time.gmtime(t0).tm_year - int(jm[:4])) * 12 + time.gmtime(t0).tm_mon - int(jm[5:])
                 if jm else None),
@@ -423,10 +462,13 @@ def main():
     ap = argparse.ArgumentParser(description="Compute location-proxy features")
     ap.add_argument("--db", default="threads.db")
     ap.add_argument("--csv", type=Path, help="also export post_features.csv / user_features.csv here")
+    ap.add_argument("--topic", type=Path,
+                    help="topic file; its `period` and `peaks` enable the join-vs-conflict features")
     a = ap.parse_args()
 
     db = sqlite3.connect(a.db)
-    post_rows, user_rows, clusters, post_clusters = build(db)
+    topic = json.loads(a.topic.read_text(encoding="utf-8")) if a.topic else None
+    post_rows, user_rows, clusters, post_clusters = build(db, topic)
     write_table(db, "post_features", POST_COLS, post_rows)
     write_table(db, "user_features", USER_COLS, user_rows)
     write_table(db, "text_clusters", CLUSTER_COLS, clusters)

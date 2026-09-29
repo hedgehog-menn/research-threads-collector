@@ -62,6 +62,7 @@ A topic file (`topics/*.json`) has these fields:
 - `languages` (optional): a post must also be detected as one of these languages, using `features.py`'s detector. `["en"]` keeps Chinese posts that mention "KMT" off-topic.
 - `seeds`: Threads handles without `@`
 - `search_modes` (optional): `["recent"]` (the default, newest first) and/or `["top"]` (Threads' own ranking, which surfaces older posts)
+- `peaks` (optional): months of peak events, such as `["2025-07", "2025-12"]`, used by `features.py --topic`
 - `period` (optional): `{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}` makes this a **historical** topic. Seed profiles are scrolled back until they reach `from`, up to `--seed-scrolls`, default 400. Later rounds only scroll back to the previous visit. Post pages are opened for on-topic posts inside the period, once each, instead of the rolling 14-day window.
 - `exclude_users` (optional): accounts whose posts are kept but never opened as profiles or location-checked, such as `meta.ai`, Meta's AI bot that replies to users
 
@@ -74,7 +75,7 @@ One `snowball` round:
 1. searches each keyword (recent posts) and opens each seed profile
 2. opens the post pages of recent on-topic posts that have replies, to collect the replies
 3. opens the profiles of repliers and on-topic authors, most active first
-4. looks up the country of up to `--max-locations` on-topic authors
+4. looks up the country (and join date) of up to `--max-locations` on-topic authors: members of cross-account copy clusters first, then the most active authors, since account-level evidence only exists for looked-up users
 
 Every stage has a limit (`--max-post-pages`, `--max-profiles`, `--max-locations` and the `--*-scrolls` options; see `snowball -h`). A default round takes about an hour. Re-running is safe: post pages are re-opened at most once per 20 h, for posts up to 14 days old, which builds the engagement time series in `post_snapshots`. Profiles are re-opened at most once a week.
 
@@ -164,6 +165,7 @@ FROM visits GROUP BY run_id, kind;
 ```zsh
 python features.py                          # reads and writes threads.db
 python features.py --csv features_out/      # also export CSVs
+python features.py --topic topics/th_kh_border_en.json   # adds join-vs-conflict features
 ```
 
 It needs no browser and can run at any time. Each run replaces the `post_features` and `user_features` tables, and every row carries `features_version` and `computed_at`.
@@ -201,7 +203,7 @@ A cluster only shows that the same text appeared; it doesn't show coordination b
 Meta's definition of coordinated *inauthentic* behavior depends on deception, meaning fake or misrepresented accounts. Real users in a national conflict often copy and paste a shared message on purpose ("share this"), so keep the two kinds of evidence as separate feature groups:
 
 - **Coordination** (what accounts do together): `text_clusters`, `n_copy_posts`, `n_copy_partners`, `fastest_copy_gap_s`, and later co-reply patterns
-- **Inauthenticity** (what an account is): `joined_month` and `account_age_months` (parsed from the "About this profile" text in `country_raw`, so only for location-checked users), `tz_margin` and `tz_quiet_share` (no rhythm or the wrong rhythm), `flag_tz_vs_country`, `flag_bio_vs_country`, and a "Based in" country that doesn't fit the activity
+- **Inauthenticity** (what an account is): `joined_month` and `account_age_months` (parsed from the "About this profile" text in `country_raw`, so only for location-checked users). This is the **Threads** join date, not Instagram's: it comes with a Threads signup number (zuck #1, mosseri #2), and nothing predates April 2023. About half of accounts show July 2023, the launch wave, so raw age is compressed. `signup_number` orders accounts within that wave, but only the first 100M accounts get one; `signup_over_100m` = 1 for later accounts. With `--topic`, `months_join_to_next_peak` (0 = joined in a fighting month) and `joined_in_period` relate the join date to the conflict. Everything is month precision only; `tz_margin` and `tz_quiet_share` (no rhythm or the wrong rhythm), `flag_tz_vs_country`, `flag_bio_vs_country`, and a "Based in" country that doesn't fit the activity
 - **Descriptive** (context, not evidence): `lang`, `top_lang`, `tz_offset`, `n_posts`
 
 ## Troubleshooting

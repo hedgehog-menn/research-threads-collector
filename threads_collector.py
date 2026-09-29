@@ -721,14 +721,27 @@ async def snowball(col: Collector, topic: dict, a):
     print(f"tagged {st.tag_topic(topic)} on-topic posts")
 
     if a.max_locations:
-        todo = [r[0] for r in st.db.execute(
-            """SELECT p.username FROM posts p JOIN post_topics t
+        # Account-level evidence (country, join date) only exists for looked-up users and the
+        # batch is capped, so look up the accounts we most need to judge first: members of
+        # cross-account copy clusters among on-topic posts, then the most active authors.
+        from features import text_clusters  # lazy: keeps the collector light otherwise
+        on_rows = st.db.execute(
+            """SELECT p.pk, p.username, p.text, p.taken_at FROM posts p JOIN post_topics t
+                 ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1""", (name,)).fetchall()
+        in_clusters = {u for c in text_clusters(on_rows) if c["n_accounts"] >= 2
+                       for u in json.loads(c["usernames"])}
+        candidates = st.db.execute(
+            """SELECT p.username, COUNT(*) FROM posts p JOIN post_topics t
                  ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1
                JOIN users u ON u.pk = p.user_pk
                WHERE u.country_checked_at IS NULL
                  AND p.username NOT IN (SELECT value FROM json_each(?))
-               GROUP BY p.username ORDER BY COUNT(*) DESC LIMIT ?""",
-            (name, json.dumps(topic["exclude_users"]), a.max_locations))]
+               GROUP BY p.username""",
+            (name, json.dumps(topic["exclude_users"]))).fetchall()
+        candidates.sort(key=lambda r: (r[0] not in in_clusters, -r[1]))
+        todo = [u for u, _ in candidates[:a.max_locations]]
+        print(f"location lookups: {len(todo)} "
+              f"({sum(u in in_clusters for u in todo)} copy-cluster members first)")
         await col.locations(todo)
 
     row = st.db.execute(
