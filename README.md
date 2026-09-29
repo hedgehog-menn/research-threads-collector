@@ -180,6 +180,22 @@ It needs no browser and can run at any time. Each run replaces the `post_feature
 - `bio_country`, `bio_term`: the first place name or flag emoji in the bio, from a small list (`BIO_PLACES`). "中國" alone is deliberately not a China term, because it appears in 中國國民黨 and 中國文化大學. Bios are only collected for profiles that were opened (by `profile`, `snowball` or `location`).
 - `flag_bio_vs_country`, `flag_tz_vs_country` (only when `tz_margin` ≥ 0.05, with 2 h of slack), `flag_simplified_in_taiwan` (`country` is Taiwan and `simp_share` > 0.5)
 
+### Copy-paste clusters
+
+`features.py` also finds posts with the same or nearly the same text from different accounts, a basic coordination signal. Text is normalized first: links, @mentions, hashtags, punctuation, emoji and spacing are removed, and it is lowercased. Texts shorter than 40 characters are skipped. Two posts are grouped when their normalized texts are identical, or share at least 80% of their character 5-grams, which works for Thai and Khmer too.
+
+- **`text_clusters`**: `n_posts`, `n_accounts`, `usernames`, `exact` (1 = identical after normalization), `first_at`, `last_at`, `span_hours`, `sample_text`
+- **`post_text_clusters`**: `post_pk` → `cluster_id`
+- In `user_features`: `n_copy_posts` (the user's posts in clusters spanning 2+ accounts) and `n_copy_partners` (the other accounts they share copied text with)
+
+```sql
+-- copied text across accounts, the most accounts first
+SELECT n_accounts, n_posts, span_hours, usernames, sample_text
+FROM text_clusters WHERE n_accounts >= 2 ORDER BY n_accounts DESC, span_hours;
+```
+
+A cluster only shows that the same text appeared; it doesn't show coordination by itself. Outlets reposting wire copy, or users sharing the same article title, cluster too.
+
 ## Troubleshooting
 
 - **`redirected to login wall`**: the session expired. Run `login` again.

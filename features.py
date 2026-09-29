@@ -5,9 +5,12 @@ features.py - offline location-proxy features for collected Threads data.
 Complements users.country ("Based in", often hidden) with three independent signals,
 and flags where they disagree. The flags are candidate CIB features, not labels.
 
-  post_features  per post: language, writing system, Traditional/Simplified char counts
-  user_features  per user: Simplified share, dominant language, active-hours UTC offset,
-                 self-declared location in bio, mismatch flags
+  post_features       per post: language, writing system, Traditional/Simplified char counts
+  user_features       per user: Simplified share, dominant language, active-hours UTC offset,
+                      self-declared location in bio, mismatch flags, copy-paste counts
+  text_clusters       groups of posts with the same or nearly the same text (copy-paste),
+                      with how many accounts posted them and over what time span
+  post_text_clusters  which cluster each duplicated post belongs to
 
 Usage:
   python features.py                    # reads/writes threads.db
@@ -31,7 +34,7 @@ from pathlib import Path
 import hanzidentifier as hz
 from lingua import LanguageDetectorBuilder
 
-FEATURES_VERSION = "1"
+FEATURES_VERSION = "2"
 
 MIN_LATIN_LETTERS = 12  # below this, Latin-script language detection is guesswork
 MIN_TZ_POSTS = 20       # posts needed to fit an active-hours offset
@@ -203,6 +206,83 @@ def bio_location(bio: str):
     return (best[1], best[2]) if best else (None, None)
 
 
+# ---------------------------------------------------------------- copy-paste clusters
+
+MIN_DUP_CHARS = 40     # normalized text shorter than this is too generic to call a copy
+SHINGLE = 5            # character n-gram size; works for scripts without spaces too
+MAX_SHINGLE_DF = 200   # ignore n-grams this common when looking for candidate pairs
+MIN_SHARED = 8         # shared rare n-grams before a pair is compared in full
+DUP_JACCARD = 0.8      # n-gram overlap at or above this = near-duplicate
+HASHTAG_RE = re.compile(r"#\S+")
+
+
+def normalize_for_dup(text: str) -> str:
+    """Lowercase letters and digits only: drops links, @mentions, hashtags, punctuation,
+    emoji and spacing, so trivial edits don't hide a copy."""
+    t = HASHTAG_RE.sub(" ", clean(text)).lower()
+    return "".join(ch for ch in t if ch.isalnum())
+
+
+def text_clusters(posts):
+    """posts: [(pk, username, text, taken_at)] -> list of clusters of 2+ posts whose
+    normalized texts are identical or overlap >= DUP_JACCARD (character n-grams)."""
+    norm = [(pk, u, normalize_for_dup(t), ts) for pk, u, t, ts in posts]
+    norm = [x for x in norm if len(x[2]) >= MIN_DUP_CHARS]
+    grams = [{n[i:i + SHINGLE] for i in range(len(n) - SHINGLE + 1)} for _, _, n, _ in norm]
+
+    parent = list(range(len(norm)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    # exact copies first (cheap), then near copies via an inverted index of rare n-grams
+    first_by_text = {}
+    for i, (_, _, n, _) in enumerate(norm):
+        if n in first_by_text:
+            parent[find(i)] = find(first_by_text[n])
+        else:
+            first_by_text[n] = i
+    index: dict[str, list[int]] = {}
+    for i, g in enumerate(grams):
+        for sh in g:
+            index.setdefault(sh, []).append(i)
+    shared = Counter()
+    for ids in index.values():
+        if 1 < len(ids) <= MAX_SHINGLE_DF:
+            for a in range(len(ids)):
+                for b in range(a + 1, len(ids)):
+                    shared[(ids[a], ids[b])] += 1
+    for (i, j), n in shared.items():
+        if n >= MIN_SHARED and find(i) != find(j):
+            if len(grams[i] & grams[j]) / len(grams[i] | grams[j]) >= DUP_JACCARD:
+                parent[find(i)] = find(j)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(len(norm)):
+        groups.setdefault(find(i), []).append(i)
+    clusters = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        rows = [norm[i] for i in members]
+        pks = sorted(r[0] for r in rows)
+        times = [r[3] for r in rows if r[3]]
+        users = sorted({r[1] for r in rows})
+        first = min(rows, key=lambda r: r[3] or 0)
+        clusters.append({
+            "cluster_id": pks[0], "post_pks": pks, "n_posts": len(rows),
+            "n_accounts": len(users), "usernames": json.dumps(users, ensure_ascii=False),
+            "exact": int(len({r[2] for r in rows}) == 1),
+            "first_at": min(times) if times else None, "last_at": max(times) if times else None,
+            "span_hours": round((max(times) - min(times)) / 3600, 2) if times else None,
+            "first_post_pk": first[0],
+        })
+    return clusters
+
+
 # ---------------------------------------------------------------- tables
 
 POST_COLS = ["post_pk", "user_pk", "lang", "lang_conf", "script", "n_han", "n_trad_only",
@@ -211,21 +291,40 @@ USER_COLS = ["user_pk", "username", "country", "n_posts", "top_lang", "top_lang_
              "n_trad_only", "n_simp_only", "simp_share", "tz_offset", "tz_margin",
              "tz_quiet_share", "tz_n_posts", "bio_country", "bio_term",
              "flag_bio_vs_country", "flag_tz_vs_country", "flag_simplified_in_taiwan",
-             "features_version", "computed_at"]
+             "n_copy_posts", "n_copy_partners", "features_version", "computed_at"]
+CLUSTER_COLS = ["cluster_id", "n_posts", "n_accounts", "usernames", "exact", "first_at",
+                "last_at", "span_hours", "first_post_pk", "sample_text",
+                "features_version", "computed_at"]
+POST_CLUSTER_COLS = ["post_pk", "cluster_id"]
 
 
 def build(db: sqlite3.Connection):
     t0 = int(time.time())
     pa = PostAnalyzer()
-    posts = db.execute("SELECT pk, user_pk, text, taken_at FROM posts").fetchall()
+    posts = db.execute("SELECT pk, user_pk, text, taken_at, username FROM posts").fetchall()
     post_rows = []
-    for pk, upk, text, _ in posts:
+    for pk, upk, text, _, _ in posts:
         f = pa.analyze(text)
         post_rows.append({"post_pk": pk, "user_pk": upk, **f,
                           "features_version": FEATURES_VERSION, "computed_at": t0})
     by_user: dict[str, list] = {}
-    for (pk, upk, _, ts), f in zip(posts, post_rows):
+    for (pk, upk, _, ts, _), f in zip(posts, post_rows):
         by_user.setdefault(upk, []).append((ts, f))
+
+    clusters = text_clusters([(pk, u, t, ts) for pk, _, t, ts, u in posts])
+    text_of = {pk: t for pk, _, t, _, _ in posts}
+    user_of = {pk: u for pk, _, _, _, u in posts}
+    copy_posts, partners = Counter(), {}
+    for c in clusters:
+        c.update(sample_text=(text_of[c["first_post_pk"]] or "")[:300],
+                 features_version=FEATURES_VERSION, computed_at=t0)
+        if c["n_accounts"] < 2:
+            continue  # one account repeating itself is not cross-account copying
+        users = json.loads(c["usernames"])
+        for u in users:
+            partners.setdefault(u, set()).update(x for x in users if x != u)
+        for pk in c["post_pks"]:
+            copy_posts[user_of[pk]] += 1
 
     user_rows = []
     for upk, username, country, bio in db.execute(
@@ -257,9 +356,13 @@ def build(db: sqlite3.Connection):
                 if exp and tz is not None and tzm >= MIN_TZ_MARGIN else None),
             "flag_simplified_in_taiwan": (
                 int(simp_share > 0.5) if country == "Taiwan" and simp_share is not None else None),
+            "n_copy_posts": copy_posts.get(username, 0),
+            "n_copy_partners": len(partners.get(username, ())),
             "features_version": FEATURES_VERSION, "computed_at": t0,
         })
-    return post_rows, user_rows
+    post_clusters = [{"post_pk": pk, "cluster_id": c["cluster_id"]}
+                     for c in clusters for pk in c["post_pks"]]
+    return post_rows, user_rows, clusters, post_clusters
 
 
 def write_table(db, name, cols, rows):
@@ -278,17 +381,21 @@ def main():
     a = ap.parse_args()
 
     db = sqlite3.connect(a.db)
-    post_rows, user_rows = build(db)
+    post_rows, user_rows, clusters, post_clusters = build(db)
     write_table(db, "post_features", POST_COLS, post_rows)
     write_table(db, "user_features", USER_COLS, user_rows)
+    write_table(db, "text_clusters", CLUSTER_COLS, clusters)
+    write_table(db, "post_text_clusters", POST_CLUSTER_COLS, post_clusters)
     db.commit()
 
     if a.csv:
         a.csv.mkdir(parents=True, exist_ok=True)
         for name, cols, rows in [("post_features", POST_COLS, post_rows),
-                                 ("user_features", USER_COLS, user_rows)]:
+                                 ("user_features", USER_COLS, user_rows),
+                                 ("text_clusters", CLUSTER_COLS, clusters),
+                                 ("post_text_clusters", POST_CLUSTER_COLS, post_clusters)]:
             with open(a.csv / f"{name}.csv", "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=cols)
+                w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
                 w.writeheader()
                 w.writerows(rows)
 
@@ -301,6 +408,10 @@ def main():
     for flag in ("flag_bio_vs_country", "flag_tz_vs_country", "flag_simplified_in_taiwan"):
         vals = [u[flag] for u in user_rows if u[flag] is not None]
         print(f"  {flag}: {sum(vals)} of {len(vals)} checkable")
+    multi = [c for c in clusters if c["n_accounts"] >= 2]
+    print(f"  copy-paste clusters: {len(clusters)} ({len(multi)} spanning 2+ accounts, "
+          f"{sum(c['n_posts'] for c in multi)} posts, "
+          f"{sum(u['n_copy_posts'] > 0 for u in user_rows)} accounts involved)")
 
 
 if __name__ == "__main__":

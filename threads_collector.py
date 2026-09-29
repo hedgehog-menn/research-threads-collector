@@ -545,8 +545,16 @@ class Collector:
         """Best-effort: open 'About this profile' and read the 'Based in' line.
         UI selectors WILL need adjusting - run with --headful the first time."""
         started = now()
-        await self.page.goto(f"{BASE}/@{username}", wait_until="domcontentloaded")
-        await self.page.wait_for_timeout(2500)
+        try:
+            await self.page.goto(f"{BASE}/@{username}", wait_until="domcontentloaded", timeout=45_000)
+            await self.page.wait_for_timeout(2500)
+        except Exception as e:
+            # navigation failed: count it toward the consecutive-failure stop, but don't mark
+            # the user as checked, so a later round retries
+            print(f"[location] @{username}: page did not load ({type(e).__name__})")
+            self.store.log_visit(self.run_id, "location", username, started, 0, 0,
+                                 f"error:{type(e).__name__}")
+            return False
         if "/login" in self.page.url:
             self.store.log_visit(self.run_id, "location", username, started, 0, 0, "login_wall")
             raise LoginWall(username)
@@ -646,11 +654,18 @@ async def snowball(col: Collector, topic: dict, a):
             await polite_pause()
     for u in topic["seeds"]:
         if topic["period_ts"]:
-            # scroll back to the period start the first time; later only to the last visit
+            # Scroll back to the period start until some visit has actually reached it;
+            # after that, only back to the last visit (a shallow earlier visit - e.g. a
+            # handle check - must not stop later rounds from going deep).
+            start = topic["period_ts"][0]
+            oldest = st.db.execute(
+                "SELECT MIN(taken_at) FROM posts WHERE username=? AND found_as='result'",
+                (u,)).fetchone()[0]
             last = st.db.execute(
                 "SELECT MAX(started_at) FROM visits WHERE kind='profile' AND target=? AND status='ok'",
                 (u,)).fetchone()[0]
-            stop = max(topic["period_ts"][0], last - 86400) if last else topic["period_ts"][0]
+            reached = oldest is not None and oldest <= start
+            stop = max(start, last - 86400) if last and reached else start
             await col.visit(f"{BASE}/@{u}", f"profile:{u}", a.seed_scrolls, stop_before=stop)
         else:
             await col.visit(f"{BASE}/@{u}", f"profile:{u}", a.profile_scrolls)

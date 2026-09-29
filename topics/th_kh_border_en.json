@@ -151,7 +151,7 @@
       "Royal Thai Army"
     ]
   ],
-  "seeds_todo": "Checked 2026-09-30 (all real, active outlet accounts): Thai side thaipbsworld, khaosodenglish (inactive since 2026-02, has 2025 posts); Cambodian side phnompenhpost, cambodianess; international reuters, apnews, aljazeeraenglish, channelnewsasia. Not found: bangkokpost, nationthailand, khmertimes, bbcnews. On-topic = a Cambodian-side keyword AND a Thai-side term AND a conflict term (require_any has two groups). The conflict group was added 2026-09-30 after travel/food/ranking posts that merely named both countries were found in the 'after' phase.",
+  "seeds_todo": "Checked 2026-09-30 (all real, active outlet accounts): Thai side thaipbsworld, khaosodenglish (inactive since 2026-02, has 2025 posts); Cambodian side phnompenhpost (1,304 posts on the first deep scroll; an earlier '24 posts, new account' note was wrong, caused by a shallow handle-check visit), cambodianess; international reuters, apnews, aljazeeraenglish, channelnewsasia. Not found: bangkokpost, nationthailand, khmertimes, bbcnews. On-topic = a Cambodian-side keyword AND a Thai-side term AND a conflict term (require_any has two groups). The conflict group was added 2026-09-30 after travel/food/ranking posts that merely named both countries were found in the 'after' phase.",
   "seeds": [
     "thaipbsworld",
     "khaosodenglish",
