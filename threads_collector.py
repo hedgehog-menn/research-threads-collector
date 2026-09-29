@@ -27,6 +27,7 @@ check the schema.
 """
 import argparse
 import asyncio
+import calendar
 import json
 import random
 import re
@@ -209,6 +210,7 @@ class Store:
         self.thread_pos: dict[str, tuple[str, int]] = {}
         self.new_posts = 0
         self.seen_posts = 0  # new + already-known posts; used to detect end of feed
+        self.result_times: list[int] = []  # taken_at of `result` posts, in arrival order
 
     def upsert_user(self, u: dict):
         pk = str(u.get("pk") or u.get("id") or "")
@@ -263,6 +265,8 @@ class Store:
             (pk, t, f["like_count"], f["reply_count"], f["repost_count"], f["quote_count"]),
         )
         self.seen_posts += 1
+        if found_as == "result" and f["taken_at"]:
+            self.result_times.append(f["taken_at"])
         if not exists:
             self.new_posts += 1
 
@@ -483,11 +487,11 @@ class Collector:
         if self.pending:
             await asyncio.gather(*list(self.pending), return_exceptions=True)
 
-    async def visit(self, url: str, source: str, scrolls: int):
+    async def visit(self, url: str, source: str, scrolls: int, stop_before: int | None = None):
         kind, _, target = source.partition(":")
         started, start_new, start_seen = now(), self.store.new_posts, self.store.seen_posts
         try:
-            await self._visit(url, source, scrolls)
+            await self._visit(url, source, scrolls, stop_before)
         except LoginWall:
             self.store.log_visit(self.run_id, kind, target, started, 0, 0, "login_wall")
             raise
@@ -502,7 +506,7 @@ class Collector:
                              self.store.new_posts - start_new,
                              self.store.seen_posts - start_seen, "ok")
 
-    async def _visit(self, url: str, source: str, scrolls: int):
+    async def _visit(self, url: str, source: str, scrolls: int, stop_before: int | None = None):
         self.source = source
         start = self.store.new_posts
         await self.page.goto(url, wait_until="domcontentloaded", timeout=45_000)
@@ -516,11 +520,17 @@ class Collector:
         idle = 0
         for _ in range(scrolls):
             before = self.store.seen_posts
+            mark = len(self.store.result_times)
             await self.page.mouse.wheel(0, random.randint(2500, 4500))
             await self.page.wait_for_timeout(random.uniform(1500, 3500))
             await self._drain()
             idle = idle + 1 if self.store.seen_posts == before else 0
             if idle >= 3:  # nothing loaded after 3 scrolls -> end of feed or rate-limited
+                break
+            # Reached back far enough: even the newest post in this batch is older than
+            # the cutoff. (Checked per batch, so an old pinned post doesn't stop it early.)
+            batch = self.store.result_times[mark:]
+            if stop_before and batch and max(batch) < stop_before:
                 break
 
         await self._drain()
@@ -607,6 +617,13 @@ def load_topic(path) -> dict:
     topic["seeds"] = [s.lstrip("@") for s in topic.get("seeds", []) if not s.startswith("#")]
     topic.setdefault("search", topic["keywords"])  # search terms default to the tag keywords
     topic["exclude_users"] = [u.lstrip("@") for u in topic.get("exclude_users", [])]
+    topic.setdefault("search_modes", ["recent"])
+    # optional historical window {"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"} (UTC, inclusive)
+    per = topic.get("period")
+    topic["period_ts"] = (
+        (int(calendar.timegm(time.strptime(per["from"], "%Y-%m-%d"))),
+         int(calendar.timegm(time.strptime(per["to"], "%Y-%m-%d"))) + 86399)
+        if per else None)
     return topic
 
 
@@ -619,27 +636,43 @@ async def snowball(col: Collector, topic: dict, a):
     print(f"== run {col.run_id}  topic={name}")
 
     for kw in topic["search"]:
-        await col.visit(search_url(kw), f"search:{kw}", a.search_scrolls)
-        await polite_pause()
+        for mode in topic["search_modes"]:  # "recent" = newest first, "top" = Threads' ranking
+            kind = "search" if mode == "recent" else "search_top"
+            await col.visit(search_url(kw, recent=mode == "recent"), f"{kind}:{kw}", a.search_scrolls)
+            await polite_pause()
     for u in topic["seeds"]:
-        await col.visit(f"{BASE}/@{u}", f"profile:{u}", a.profile_scrolls)
+        if topic["period_ts"]:
+            # scroll back to the period start the first time; later only to the last visit
+            last = st.db.execute(
+                "SELECT MAX(started_at) FROM visits WHERE kind='profile' AND target=? AND status='ok'",
+                (u,)).fetchone()[0]
+            stop = max(topic["period_ts"][0], last - 86400) if last else topic["period_ts"][0]
+            await col.visit(f"{BASE}/@{u}", f"profile:{u}", a.seed_scrolls, stop_before=stop)
+        else:
+            await col.visit(f"{BASE}/@{u}", f"profile:{u}", a.profile_scrolls)
         await polite_pause()
     print(f"tagged {st.tag_topic(topic)} on-topic posts")
 
-    # Post pages: recent on-topic posts that have replies and weren't opened in the last
-    # `revisit_hours`; never-opened first, then the most replied-to.
-    since = now() - a.revisit_days * 86400
-    fresh = now() - a.revisit_hours * 3600
+    # Post pages: on-topic posts with replies, never-opened first, then the most replied-to.
+    # Live topics: posts from the last `revisit_days`, re-opened every `revisit_hours`
+    # (builds the snapshot time series). Historical topics (`period`): posts inside the
+    # period, each opened once - their conversations are over.
+    if topic["period_ts"]:
+        since, until = topic["period_ts"]
+        fresh = 0  # v.last < 0 never holds: only never-opened posts
+    else:
+        since, until = now() - a.revisit_days * 86400, now()
+        fresh = now() - a.revisit_hours * 3600
     urls = [r[0] for r in st.db.execute(
         """SELECT p.url FROM posts p JOIN post_topics t ON t.post_pk = p.pk AND t.topic = ?
            LEFT JOIN (SELECT target, MAX(started_at) last FROM visits
                       WHERE kind = 'post' AND status = 'ok' GROUP BY target) v
                   ON v.target = p.url
            WHERE t.on_topic = 1 AND p.found_as = 'result' AND p.url IS NOT NULL
-             AND p.reply_count > 0 AND p.taken_at >= ?
+             AND p.reply_count > 0 AND p.taken_at BETWEEN ? AND ?
              AND (v.last IS NULL OR v.last < ?)
            ORDER BY v.last IS NOT NULL, p.reply_count DESC LIMIT ?""",
-        (name, since, fresh, a.max_post_pages))]
+        (name, since, until, fresh, a.max_post_pages))]
     for url in urls:
         await col.visit(url, f"post:{url}", a.post_scrolls)
         await polite_pause()
@@ -705,6 +738,8 @@ def build_args():
     p.add_argument("topic", help="topic file, e.g. topics/tw2026_local.json")
     p.add_argument("--search-scrolls", type=int, default=30)
     p.add_argument("--profile-scrolls", type=int, default=10)
+    p.add_argument("--seed-scrolls", type=int, default=400,
+                   help="max scrolls per seed profile when the topic has a period (stops at the period start)")
     p.add_argument("--post-scrolls", type=int, default=10)
     p.add_argument("--max-post-pages", type=int, default=30)
     p.add_argument("--max-profiles", type=int, default=30)

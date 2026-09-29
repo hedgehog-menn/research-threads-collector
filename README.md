@@ -61,9 +61,15 @@ A topic file (`topics/*.json`) has these fields:
 - `require_any` (optional): a post must also contain one of these context words. For example, "DPP" only counts next to "Taiwan", "Taipei" and so on, which excludes Kenya's Director of Public Prosecutions.
 - `languages` (optional): a post must also be detected as one of these languages, using `features.py`'s detector. `["en"]` keeps Chinese posts that mention "KMT" off-topic.
 - `seeds`: Threads handles without `@`
+- `search_modes` (optional): `["recent"]` (the default, newest first) and/or `["top"]` (Threads' own ranking, which surfaces older posts)
+- `period` (optional): `{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}` makes this a **historical** topic. Seed profiles are scrolled back until they reach `from`, up to `--seed-scrolls`, default 400. Later rounds only scroll back to the previous visit. Post pages are opened for on-topic posts inside the period, once each, instead of the rolling 14-day window.
 - `exclude_users` (optional): accounts whose posts are kept but never opened as profiles or location-checked, such as `meta.ai`, Meta's AI bot that replies to users
 
-Two topics exist: `tw2026_local_en.json` (English, the current focus) and `tw2026_local.json` (Traditional Chinese). One `snowball` round:
+Topics:
+- `th_kh_border_en.json`: **the current focus.** Thailand–Cambodia border conflict, English, historical period May 2025 – January 2026.
+- `tw2026_local_en.json` and `tw2026_local.json`: Taiwan 2026 local elections, in English and Traditional Chinese. These are on hold; the English Taiwan content was too thin.
+
+One `snowball` round:
 
 1. searches each keyword (recent posts) and opens each seed profile
 2. opens the post pages of recent on-topic posts that have replies, to collect the replies
@@ -76,7 +82,7 @@ The run stops at a login wall (exit code 2) and stops location lookups after 3 f
 
 ### Scheduled collection
 
-`systemd/` has a user timer that runs `scripts/collect.sh` twice a day (09:00 and 21:00, with a random delay of up to 45 min). Missed runs happen after the laptop wakes. The script collects `topics/tw2026_local_en.json` by default. To add the Chinese topic, set `THREADS_TOPICS="topics/tw2026_local_en.json topics/tw2026_local.json"` in the script or the service file. Each topic adds about an hour per round. Logs go to `logs/YYYY-MM-DD.log`. To enable it:
+`systemd/` has a user timer that runs `scripts/collect.sh` twice a day (09:00 and 21:00, with a random delay of up to 45 min). Missed runs happen after the laptop wakes. The script collects `topics/th_kh_border_en.json` by default. To collect several topics, set `THREADS_TOPICS` to a space-separated list in the script or the service file. Each topic adds about an hour per round. Logs go to `logs/YYYY-MM-DD.log`. To enable it:
 
 ```zsh
 mkdir -p ~/.config/systemd/user

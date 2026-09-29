@@ -1,0 +1,31 @@
+{
+  "name": "th_kh_border_en",
+  "description": "Thailand-Cambodia border conflict, English-language posts. Fighting in July 2025 (Kuala Lumpur ceasefire 2025-07-28) and December 2025 (20 days, ceasefire 2025-12-27). The period below covers the May 2025 skirmish and June leaked-call crisis through January 2026.",
+  "languages": ["en"],
+  "period": {"from": "2025-05-01", "to": "2026-01-31"},
+  "search_modes": ["top"],
+  "search": [
+    "Thailand Cambodia border", "Thailand Cambodia clashes", "Thailand Cambodia ceasefire",
+    "Thailand Cambodia war", "Thai Cambodian border conflict", "Preah Vihear",
+    "Ta Muen Thom", "Hun Sen Paetongtarn", "Hun Manet Thailand", "Anutin Cambodia",
+    "Cambodia landmine Thai soldiers", "Kuala Lumpur Peace Accord"
+  ],
+  "keywords": [
+    "Cambodia", "Cambodian", "Cambodians", "Khmer", "Phnom Penh", "Hun Sen", "Hun Manet",
+    "Preah Vihear", "Ta Muen Thom", "Ta Moan Thom", "Ta Muen Tot", "Ta Krabey", "Ta Kwai",
+    "Oddar Meanchey", "Banteay Meanchey", "Chong Bok", "Emerald Triangle",
+    "Kuala Lumpur Peace Accord"
+  ],
+  "require_any": [
+    "Thailand", "Thai", "Thais", "Siam", "Bangkok", "Paetongtarn", "Anutin",
+    "Surin", "Sisaket", "Si Sa Ket", "Ubon Ratchathani", "Buriram",
+    "Preah Vihear", "Ta Muen Thom", "Ta Moan Thom", "Ta Muen Tot", "Ta Krabey", "Ta Kwai",
+    "Chong Bok", "Emerald Triangle", "Kuala Lumpur Peace Accord"
+  ],
+  "seeds_todo": "Checked 2026-09-30 (all real, active outlet accounts): Thai side thaipbsworld, khaosodenglish (inactive since 2026-02, has 2025 posts); Cambodian side phnompenhpost, cambodianess; international reuters, apnews, aljazeeraenglish, channelnewsasia. Not found: bangkokpost, nationthailand, khmertimes, bbcnews. Known false positives: posts mentioning both countries for travel or food (e.g. 'Thai and Khmer cuisine') count as on-topic.",
+  "seeds": [
+    "thaipbsworld", "khaosodenglish", "phnompenhpost", "cambodianess",
+    "reuters", "apnews", "aljazeeraenglish", "channelnewsasia"
+  ],
+  "exclude_users": ["meta.ai"]
+}

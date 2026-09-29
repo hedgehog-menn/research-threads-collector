@@ -5,7 +5,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PY="${THREADS_PY:-$HOME/.conda/envs/threads-scraper/bin/python}"
-TOPICS="${THREADS_TOPICS:-topics/tw2026_local_en.json}"
+TOPICS="${THREADS_TOPICS:-topics/th_kh_border_en.json}"
 mkdir -p logs
 LOG="logs/$(date +%F).log"
 code=0
