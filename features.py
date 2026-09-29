@@ -34,7 +34,7 @@ from pathlib import Path
 import hanzidentifier as hz
 from lingua import LanguageDetectorBuilder
 
-FEATURES_VERSION = "4"
+FEATURES_VERSION = "5"
 
 MIN_LATIN_LETTERS = 12  # below this, Latin-script language detection is guesswork
 MIN_TZ_POSTS = 20       # posts needed to fit an active-hours offset
@@ -349,17 +349,20 @@ USER_COLS = ["user_pk", "username", "country", "n_posts", "top_lang", "top_lang_
              "n_trad_only", "n_simp_only", "simp_share", "tz_offset", "tz_margin",
              "tz_quiet_share", "tz_n_posts", "bio_country", "bio_term",
              "flag_bio_vs_country", "flag_tz_vs_country", "flag_simplified_in_taiwan",
-             "n_copy_posts", "n_copy_partners", "fastest_copy_gap_s",
+             "n_copy_posts", "n_copy_partners", "fastest_copy_gap_s", "min_signup_gap_to_partner",
              "joined_month", "account_age_months", "signup_number", "signup_over_100m",
              "months_join_to_next_peak", "joined_in_period", "features_version", "computed_at"]
 # Feature groups (keep them apart when modelling - see README):
 #   coordination:    n_copy_posts, n_copy_partners, fastest_copy_gap_s (+ text_clusters)
+#   bridge (both):   min_signup_gap_to_partner / text_clusters.min_signup_gap - copy
+#                    partners whose accounts were created back-to-back
 #   inauthenticity:  flag_*, tz_margin / tz_quiet_share, bio_country vs country,
 #                    joined_month / account_age_months / signup_number,
 #                    months_join_to_next_peak / joined_in_period (need --topic)
 #   descriptive:     lang, simp_share, tz_offset, n_posts
 CLUSTER_COLS = ["cluster_id", "n_posts", "n_accounts", "usernames", "exact", "first_at",
-                "last_at", "span_hours", "min_gap_s", "median_gap_s", "first_post_pk", "sample_text",
+                "last_at", "span_hours", "min_gap_s", "median_gap_s", "min_signup_gap",
+                "n_with_signup", "first_post_pk", "sample_text",
                 "features_version", "computed_at"]
 POST_CLUSTER_COLS = ["post_pk", "cluster_id"]
 
@@ -382,8 +385,15 @@ def build(db: sqlite3.Connection, topic: dict | None = None):
     user_of = {pk: u for pk, _, _, _, u in posts}
     copy_posts, partners = Counter(), {}
     time_of = {pk: ts for pk, _, _, ts, _ in posts}
+    # batch-created accounts get adjacent signup numbers; only the first 100M have one
+    signup_of = {u: n for u, raw in db.execute("SELECT username, country_raw FROM users")
+                 if (n := signup_number(raw)[0]) is not None}
     fastest: dict[str, int] = {}
+    signup_gap: dict[str, int] = {}
     for c in clusters:
+        nums = sorted(signup_of[u] for u in json.loads(c["usernames"]) if u in signup_of)
+        c["n_with_signup"] = len(nums)
+        c["min_signup_gap"] = min((b - a for a, b in zip(nums, nums[1:])), default=None)
         c.update(sample_text=(text_of[c["first_post_pk"]] or "")[:300],
                  features_version=FEATURES_VERSION, computed_at=t0)
         if c["n_accounts"] < 2:
@@ -398,6 +408,10 @@ def build(db: sqlite3.Connection, topic: dict | None = None):
         users = json.loads(c["usernames"])
         for u in users:
             partners.setdefault(u, set()).update(x for x in users if x != u)
+            if u in signup_of:
+                gaps = [abs(signup_of[u] - signup_of[x]) for x in users if x != u and x in signup_of]
+                if gaps:
+                    signup_gap[u] = min(min(gaps), signup_gap.get(u, min(gaps)))
         for pk in c["post_pks"]:
             copy_posts[user_of[pk]] += 1
 
@@ -434,6 +448,7 @@ def build(db: sqlite3.Connection, topic: dict | None = None):
             "n_copy_posts": copy_posts.get(username, 0),
             "n_copy_partners": len(partners.get(username, ())),
             "fastest_copy_gap_s": fastest.get(username),
+            "min_signup_gap_to_partner": signup_gap.get(username),
             "joined_month": (jm := joined_month(country_raw)),
             "signup_number": signup_number(country_raw)[0],
             "signup_over_100m": signup_number(country_raw)[1],
