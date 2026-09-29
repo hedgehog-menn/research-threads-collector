@@ -2,3 +2,4 @@
 *.db
 /auth.json
 __pycache__/
+/logs

@@ -19,6 +19,8 @@ Usage:
   python threads_collector.py location zuck mosseri          # "About this profile" country
   python threads_collector.py stats
   python threads_collector.py reparse                        # refill columns from raw_json
+  python threads_collector.py snowball topics/tw2026_local.json   # one topic round (cron)
+  python threads_collector.py tag topics/tw2026_local.json        # re-tag on/off-topic
 
 Add --dump-raw raw/ on the first runs to save the raw payloads so you can
 check the schema.
@@ -82,7 +84,8 @@ CREATE TABLE IF NOT EXISTS posts (
     self_thread_length INTEGER,
     is_edited INTEGER,
     ai_label TEXT,
-    last_scraped_at INTEGER
+    last_scraped_at INTEGER,
+    found_as TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_pk);
 CREATE INDEX IF NOT EXISTS idx_posts_root ON posts(thread_root_pk);
@@ -96,6 +99,29 @@ CREATE TABLE IF NOT EXISTS post_snapshots (
     quote_count INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_snap_post ON post_snapshots(post_pk);
+
+-- one row per page load, so every post can be traced to when and how it was scraped
+CREATE TABLE IF NOT EXISTS visits (
+    run_id TEXT,
+    kind TEXT,          -- search / profile / post / location
+    target TEXT,        -- keyword, username or post url
+    started_at INTEGER,
+    finished_at INTEGER,
+    new_posts INTEGER,
+    seen_posts INTEGER,
+    status TEXT         -- ok / login_wall / ui_error / error
+);
+CREATE INDEX IF NOT EXISTS idx_visits_target ON visits(kind, target);
+
+-- keyword tagging per topic; posts are tagged, never dropped
+CREATE TABLE IF NOT EXISTS post_topics (
+    post_pk TEXT,
+    topic TEXT,
+    on_topic INTEGER,
+    matched_keywords TEXT,
+    tagged_at INTEGER,
+    PRIMARY KEY (post_pk, topic)
+);
 """
 
 
@@ -119,7 +145,7 @@ POST_MIGRATIONS = {
     "reshare_count": "INTEGER", "topic_tag": "TEXT", "media_type": "TEXT",
     "quoted_post_pk": "TEXT", "link_url": "TEXT", "root_post_username": "TEXT",
     "self_thread_pos": "INTEGER", "self_thread_length": "INTEGER", "is_edited": "INTEGER",
-    "ai_label": "TEXT", "last_scraped_at": "INTEGER",
+    "ai_label": "TEXT", "last_scraped_at": "INTEGER", "found_as": "TEXT",
 }
 
 MEDIA_TYPES = {1: "image", 2: "video", 8: "carousel", 19: "text"}
@@ -204,7 +230,7 @@ class Store:
              as_int(u.get("follower_count")), u.get("biography"), t, t),
         )
 
-    def add_post(self, p: dict, source: str):
+    def add_post(self, p: dict, source: str, found_as: str = "other"):
         self.upsert_user(p["user"])
         pk = str(p.get("pk") or p.get("id")).split("_")[0]
         f = post_fields(p)
@@ -222,7 +248,10 @@ class Store:
         updates += ",\n thread_root_pk = COALESCE(thread_root_pk, excluded.thread_root_pk)"
         updates += ",\n thread_pos = COALESCE(thread_pos, excluded.thread_pos)"
 
-        exists = self.db.execute("SELECT 1 FROM posts WHERE pk=?", (pk,)).fetchone()
+        exists = self.db.execute("SELECT found_as FROM posts WHERE pk=?", (pk,)).fetchone()
+        if exists and ROLE_RANK.get(exists[0], -1) > ROLE_RANK[found_as]:
+            found_as = exists[0]  # keep the strongest role this post has been seen in
+        row["found_as"] = found_as
         cols = ", ".join(row)
         self.db.execute(
             f"INSERT INTO posts({cols}) VALUES ({','.join('?' * len(row))})"
@@ -263,6 +292,30 @@ class Store:
                 (country, raw, now(), username),
             )
         self.db.commit()
+
+    def log_visit(self, run_id, kind, target, started, new, seen, status):
+        self.db.execute(
+            "INSERT INTO visits VALUES (?,?,?,?,?,?,?,?)",
+            (run_id, kind, target, started, now(), new, seen, status),
+        )
+        self.db.commit()
+
+    def tag_topic(self, topic: dict) -> int:
+        """Tag every post as on/off-topic by keyword (case-insensitive substring)."""
+        kws = [(k, k.lower()) for k in topic["keywords"]]
+        t = now()
+        rows = self.db.execute("SELECT pk, text FROM posts").fetchall()
+        on = 0
+        for pk, text in rows:
+            low = (text or "").lower()
+            hits = [k for k, kl in kws if kl in low]
+            on += bool(hits)
+            self.db.execute(
+                "INSERT OR REPLACE INTO post_topics VALUES (?,?,?,?,?)",
+                (pk, topic["name"], int(bool(hits)), json.dumps(hits, ensure_ascii=False), t),
+            )
+        self.db.commit()
+        return on
 
     def commit(self):
         self.db.commit()
@@ -306,34 +359,80 @@ def is_user(d: dict) -> bool:
     )
 
 
+# How a post relates to the page it was found on, decided by the payload key it sits
+# under (verified against raw dumps of profile, search and post pages):
+#   result - what the page is about: the post-page target, a search hit, a profile post
+#   reply  - a reply shown on a post page (direct_replies / pinned_replies)
+#   parent - context: the posts a reply answers (containing_thread, or earlier
+#            thread_items by another author in a search hit)
+#   quoted - a quoted or reposted post embedded in another post
+#   other  - anything else on the page (suggestions, sidebars, ...)
+ROLE_RANK = {"other": 0, "quoted": 1, "parent": 2, "reply": 3, "result": 4}
+RESULT_KEYS = {"media", "mediaData", "searchResults"}
+KEY_ROLES = {
+    "direct_replies": "reply", "pinned_replies": "reply",
+    "containing_thread": "parent",
+    "quoted_post": "quoted", "reposted_post": "quoted",
+    "quoted_attachment_post": "quoted", "linked_inline_media": "quoted",
+}
+
+
+def post_pk(post: dict) -> str:
+    return str(post.get("pk") or post.get("id")).split("_")[0]
+
+
 def extract(obj, store: Store, source: str):
-    stack = [obj]
+    stack = [(obj, "other")]
     while stack:
-        x = stack.pop()
+        x, role = stack.pop()
         if isinstance(x, dict):
             items = x.get("thread_items")
-            if isinstance(items, list):  # thread chain: record root + position
-                root = None
-                for i, it in enumerate(items):
-                    post = it.get("post") if isinstance(it, dict) else None
-                    if isinstance(post, dict) and is_post(post):
-                        pk = str(post.get("pk") or post.get("id")).split("_")[0]
-                        root = root or pk
-                        store.thread_pos.setdefault(pk, (root, i))
+            if isinstance(items, list):
+                posts = [it.get("post") if isinstance(it, dict) else None for it in items]
+                posts = [(i, p) for i, p in enumerate(posts) if isinstance(p, dict) and is_post(p)]
+                if posts:
+                    # thread chain: record root + position
+                    root = post_pk(posts[0][1])
+                    for i, p in posts:
+                        store.thread_pos.setdefault(post_pk(p), (root, i))
+                    # in a result chain the last item is the hit; earlier items by the same
+                    # author are their own self-thread, others' are context
+                    if role == "result":
+                        last_user = (posts[-1][1].get("user") or {}).get("username")
+                        for i, p in posts[:-1]:
+                            same = (p.get("user") or {}).get("username") == last_user
+                            stack.append((p, "result" if same else "parent"))
+                        stack.append((posts[-1][1], "result"))
+                    else:
+                        stack.extend((p, role) for _, p in posts)
+                    stack.extend((v, role) for k, v in x.items() if k != "thread_items")
+                    continue
             if is_post(x):
-                store.add_post(x, source)
+                store.add_post(x, source, role)
             elif is_user(x):
                 store.upsert_user(x)
-            stack.extend(x.values())
+            for k, v in x.items():
+                if k in KEY_ROLES:
+                    stack.append((v, KEY_ROLES[k]))
+                elif k in RESULT_KEYS and role == "other":
+                    stack.append((v, "result"))
+                else:
+                    # a post's own children (e.g. its quoted post) are not the result
+                    stack.append((v, "other" if role == "result" and is_post(x) else role))
         elif isinstance(x, list):
-            stack.extend(x)
+            stack.extend((v, role) for v in x)
 
 
 # ---------------------------------------------------------------- browser
 
+class LoginWall(Exception):
+    """Session expired or blocked: stop the whole run instead of hammering the site."""
+
+
 class Collector:
-    def __init__(self, page, store: Store, dump_dir: Path | None):
+    def __init__(self, page, store: Store, dump_dir: Path | None, run_id: str = ""):
         self.page, self.store, self.dump_dir = page, store, dump_dir
+        self.run_id = run_id or time.strftime("%Y%m%d-%H%M%S")
         self.source = ""
         self.pending: set[asyncio.Task] = set()
         self.dump_n = 0
@@ -364,13 +463,32 @@ class Collector:
             await asyncio.gather(*list(self.pending), return_exceptions=True)
 
     async def visit(self, url: str, source: str, scrolls: int):
+        kind, _, target = source.partition(":")
+        started, start_new, start_seen = now(), self.store.new_posts, self.store.seen_posts
+        try:
+            await self._visit(url, source, scrolls)
+        except LoginWall:
+            self.store.log_visit(self.run_id, kind, target, started, 0, 0, "login_wall")
+            raise
+        except Exception as e:
+            self.store.commit()
+            self.store.log_visit(self.run_id, kind, target, started,
+                                 self.store.new_posts - start_new,
+                                 self.store.seen_posts - start_seen, f"error:{type(e).__name__}")
+            print(f"[{source}] failed: {type(e).__name__}: {e}")
+            return
+        self.store.log_visit(self.run_id, kind, target, started,
+                             self.store.new_posts - start_new,
+                             self.store.seen_posts - start_seen, "ok")
+
+    async def _visit(self, url: str, source: str, scrolls: int):
         self.source = source
         start = self.store.new_posts
         await self.page.goto(url, wait_until="domcontentloaded", timeout=45_000)
         await self.page.wait_for_timeout(2500)
         if "/login" in self.page.url:
-            print(f"[{source}] redirected to login wall - not available logged out ({url})")
-            return
+            print(f"[{source}] redirected to login wall - session expired? run `login` again ({url})")
+            raise LoginWall(url)
 
         scripts = await self.page.eval_on_selector_all(
             'script[type="application/json"]', "els => els.map(e => e.textContent)"
@@ -393,11 +511,15 @@ class Collector:
         self.store.commit()
         print(f"[{source}] +{self.store.new_posts - start} new posts  ({url})")
 
-    async def fetch_country(self, username: str):
+    async def fetch_country(self, username: str) -> bool:
         """Best-effort: open 'About this profile' and read the 'Based in' line.
         UI selectors WILL need adjusting - run with --headful the first time."""
+        started = now()
         await self.page.goto(f"{BASE}/@{username}", wait_until="domcontentloaded")
         await self.page.wait_for_timeout(2500)
+        if "/login" in self.page.url:
+            self.store.log_visit(self.run_id, "location", username, started, 0, 0, "login_wall")
+            raise LoginWall(username)
         try:
             # Several "More" buttons exist (the sidebar one opens Settings); try each until
             # one opens a menu containing "About this profile".
@@ -419,17 +541,114 @@ class Collector:
         except Exception as e:
             self.store.set_country(username, None, f"ui_error:{type(e).__name__}")
             print(f"[location] @{username}: could not open dialog ({type(e).__name__})")
-            return
+            self.store.log_visit(self.run_id, "location", username, started, 0, 0, "ui_error")
+            return False
         m = re.search(r"Based in\s*\n?\s*([^\n]+)", text, re.I)
         country = m.group(1).strip() if m else None
         if country and country.lower() == "not shared":
             country = None  # user hid it; distinguishable from "no Based in row" via country_raw
         self.store.set_country(username, country, text[:1000])
         print(f"[location] @{username}: {country or 'hidden/not shown'}")
+        self.store.log_visit(self.run_id, "location", username, started, 0, 0, "ok")
+        return True
+
+    async def locations(self, usernames, max_failures: int = 3):
+        """Look up countries; stop after `max_failures` consecutive dialog failures,
+        which usually means Threads is blocking (protect the account)."""
+        fails = 0
+        for u in usernames:
+            fails = 0 if await self.fetch_country(u.lstrip("@")) else fails + 1
+            if fails >= max_failures:
+                print(f"[location] {fails} failures in a row - stopping to protect the account")
+                return
+            await polite_pause()
 
 
 async def polite_pause():
     await asyncio.sleep(random.uniform(4, 9))
+
+
+def search_url(query: str, recent: bool = True) -> str:
+    url = f"{BASE}/search?q={quote(query)}&serp_type=default"
+    return url + "&filter=recent" if recent else url
+
+
+def load_topic(path) -> dict:
+    topic = json.loads(Path(path).read_text(encoding="utf-8"))
+    topic["seeds"] = [s.lstrip("@") for s in topic.get("seeds", []) if not s.startswith("#")]
+    return topic
+
+
+async def snowball(col: Collector, topic: dict, a):
+    """One collection round: keyword search + seed profiles -> post pages of on-topic
+    posts (replies) -> repliers' profiles -> a capped batch of location lookups.
+    Re-running it (e.g. from cron) revisits recent on-topic posts, which builds the
+    post_snapshots time series."""
+    st, name = col.store, topic["name"]
+    print(f"== run {col.run_id}  topic={name}")
+
+    for kw in topic["keywords"]:
+        await col.visit(search_url(kw), f"search:{kw}", a.search_scrolls)
+        await polite_pause()
+    for u in topic["seeds"]:
+        await col.visit(f"{BASE}/@{u}", f"profile:{u}", a.profile_scrolls)
+        await polite_pause()
+    print(f"tagged {st.tag_topic(topic)} on-topic posts")
+
+    # Post pages: recent on-topic posts that have replies and weren't opened in the last
+    # `revisit_hours`; never-opened first, then the most replied-to.
+    since = now() - a.revisit_days * 86400
+    fresh = now() - a.revisit_hours * 3600
+    urls = [r[0] for r in st.db.execute(
+        """SELECT p.url FROM posts p JOIN post_topics t ON t.post_pk = p.pk AND t.topic = ?
+           LEFT JOIN (SELECT target, MAX(started_at) last FROM visits
+                      WHERE kind = 'post' AND status = 'ok' GROUP BY target) v
+                  ON v.target = p.url
+           WHERE t.on_topic = 1 AND p.found_as = 'result' AND p.url IS NOT NULL
+             AND p.reply_count > 0 AND p.taken_at >= ?
+             AND (v.last IS NULL OR v.last < ?)
+           ORDER BY v.last IS NOT NULL, p.reply_count DESC LIMIT ?""",
+        (name, since, fresh, a.max_post_pages))]
+    for url in urls:
+        await col.visit(url, f"post:{url}", a.post_scrolls)
+        await polite_pause()
+    print(f"tagged {st.tag_topic(topic)} on-topic posts")
+
+    # Profiles of people taking part in on-topic conversations (repliers on on-topic post
+    # pages, and authors of on-topic posts), most active first, skipping recent profiles.
+    users = [r[0] for r in st.db.execute(
+        """WITH opened AS (SELECT DISTINCT 'post:' || target AS src FROM visits
+                           WHERE kind = 'post' AND status = 'ok'),
+                parts AS (
+                  SELECT p.username FROM posts p JOIN post_topics t
+                    ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1
+                  UNION ALL
+                  SELECT p.username FROM posts p JOIN opened o ON p.source = o.src
+                  WHERE p.found_as = 'reply')
+           SELECT username FROM parts
+           WHERE username NOT IN (SELECT target FROM visits WHERE kind = 'profile'
+                                  AND status = 'ok' AND started_at >= ?)
+           GROUP BY username ORDER BY COUNT(*) DESC LIMIT ?""",
+        (name, now() - a.profile_revisit_days * 86400, a.max_profiles))]
+    for u in users:
+        await col.visit(f"{BASE}/@{u}", f"profile:{u}", a.profile_scrolls)
+        await polite_pause()
+    print(f"tagged {st.tag_topic(topic)} on-topic posts")
+
+    if a.max_locations:
+        todo = [r[0] for r in st.db.execute(
+            """SELECT p.username FROM posts p JOIN post_topics t
+                 ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1
+               JOIN users u ON u.pk = p.user_pk
+               WHERE u.country_checked_at IS NULL
+               GROUP BY p.username ORDER BY COUNT(*) DESC LIMIT ?""",
+            (name, a.max_locations))]
+        await col.locations(todo)
+
+    row = st.db.execute(
+        "SELECT COUNT(*), SUM(new_posts) FROM visits WHERE run_id = ?", (col.run_id,)
+    ).fetchone()
+    print(f"== run {col.run_id} done: {row[0]} page loads, +{row[1] or 0} new posts")
 
 
 # ---------------------------------------------------------------- CLI
@@ -448,6 +667,18 @@ def build_args():
     p = sub.add_parser("post"); p.add_argument("urls", nargs="+"); p.add_argument("--scrolls", type=int, default=10)
     p = sub.add_parser("search"); p.add_argument("query"); p.add_argument("--recent", action="store_true"); p.add_argument("--scrolls", type=int, default=20)
     p = sub.add_parser("location"); p.add_argument("usernames", nargs="+")
+    p = sub.add_parser("snowball", help="one topic collection round (safe to repeat from cron)")
+    p.add_argument("topic", help="topic file, e.g. topics/tw2026_local.json")
+    p.add_argument("--search-scrolls", type=int, default=30)
+    p.add_argument("--profile-scrolls", type=int, default=10)
+    p.add_argument("--post-scrolls", type=int, default=10)
+    p.add_argument("--max-post-pages", type=int, default=30)
+    p.add_argument("--max-profiles", type=int, default=30)
+    p.add_argument("--max-locations", type=int, default=50)
+    p.add_argument("--revisit-days", type=int, default=14, help="re-open post pages of on-topic posts up to this old")
+    p.add_argument("--revisit-hours", type=int, default=20, help="don't re-open a post page more often than this")
+    p.add_argument("--profile-revisit-days", type=int, default=7)
+    p = sub.add_parser("tag", help="tag posts on/off-topic by the topic's keywords"); p.add_argument("topic")
     sub.add_parser("stats")
     sub.add_parser("reparse", help="re-derive post columns from stored raw_json")
     return ap.parse_args()
@@ -455,14 +686,24 @@ def build_args():
 
 async def run(args):
     if args.cmd == "stats":
-        db = sqlite3.connect(args.db)
+        db = Store(args.db).db
         for label, q in [
             ("posts", "SELECT COUNT(*) FROM posts"),
             ("users", "SELECT COUNT(*) FROM users"),
             ("users with country", "SELECT COUNT(*) FROM users WHERE country IS NOT NULL"),
             ("snapshots", "SELECT COUNT(*) FROM post_snapshots"),
+            ("page loads", "SELECT COUNT(*) FROM visits"),
         ]:
             print(f"{label:>20}: {db.execute(q).fetchone()[0]}")
+        for topic, on, total in db.execute(
+            "SELECT topic, SUM(on_topic), COUNT(*) FROM post_topics GROUP BY topic"
+        ):
+            print(f"{'on-topic: ' + topic:>20}: {on} of {total}")
+        return
+
+    if args.cmd == "tag":
+        topic = load_topic(args.topic)
+        print(f"tagged {Store(args.db).tag_topic(topic)} on-topic posts for {topic['name']}")
         return
 
     if args.cmd == "reparse":
@@ -492,23 +733,29 @@ async def run(args):
         store = Store(args.db, keep_raw=not args.no_raw_json)
         col = Collector(page, store, args.dump_raw)
 
-        if args.cmd == "profile":
-            for u in args.usernames:
-                await col.visit(f"{BASE}/@{u.lstrip('@')}", f"profile:{u}", args.scrolls)
-                await polite_pause()
-        elif args.cmd == "post":
-            for url in args.urls:
-                await col.visit(url, f"post:{url}", args.scrolls)
-                await polite_pause()
-        elif args.cmd == "search":
-            url = f"{BASE}/search?q={quote(args.query)}&serp_type=default"
-            if args.recent:
-                url += "&filter=recent"
-            await col.visit(url, f"search:{args.query}", args.scrolls)
-        elif args.cmd == "location":
-            for u in args.usernames:
-                await col.fetch_country(u.lstrip("@"))
-                await polite_pause()
+        try:
+            if args.cmd == "snowball":
+                topic = load_topic(args.topic)
+                if not topic["seeds"]:
+                    print("note: no seed accounts in the topic file yet - keyword search only")
+                await snowball(col, topic, args)
+            elif args.cmd == "profile":
+                for u in args.usernames:
+                    await col.visit(f"{BASE}/@{u.lstrip('@')}", f"profile:{u}", args.scrolls)
+                    await polite_pause()
+            elif args.cmd == "post":
+                for url in args.urls:
+                    await col.visit(url, f"post:{url}", args.scrolls)
+                    await polite_pause()
+            elif args.cmd == "search":
+                await col.visit(search_url(args.query, args.recent), f"search:{args.query}", args.scrolls)
+            elif args.cmd == "location":
+                await col.locations(args.usernames)
+        except LoginWall:
+            print("stopped: hit the login wall. Run `login` again, then re-run.")
+            store.commit()
+            await browser.close()
+            raise SystemExit(2)
 
         store.commit()
         await browser.close()

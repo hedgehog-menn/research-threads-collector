@@ -1,0 +1,9 @@
+[Unit]
+Description=Threads collector: one snowball round (tw2026_local)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/Documents/codes/threads-collector/scripts/collect.sh
+# a round takes about an hour; kill it if it hangs
+TimeoutStartSec=3h

@@ -41,18 +41,18 @@ Verified behavior:
 - ℹ️ **`ai_label`** records Meta's "AI info" source (self-disclosure or C2PA/IPTC metadata). It is disclosure, not detection: `NONE` does not mean human-made. It is relevant to the genAI-era motivation of the dataset, but it is not a label.
 
 ## Next tasks (in order)
-1. **Commit the current fixes and this file.** Done in code but not yet committed: the engagement-count fix (the real key is `text_post_app_info`), the `reparse` command, the scroll-loop early-stop fix, field refresh on re-seen posts, and the rule that a failed location lookup doesn't overwrite an existing country.
-2. **Verify engagement counts.** Run `reparse` on the real DB, then compare about 3 posts against the browser.
-3. **Add a `found_as` column** (result / quoted / reply / parent). Right now every post found in a run gets the same `source`, so search results can't be told apart from nested quoted or suggested posts.
-4. **Simple snowball for the election topic.** Chain it: seed accounts plus keyword search → post pages → replies → repliers' profiles. Tag posts on-topic or off-topic by keyword.
-5. **Scheduled re-collection (cron). Start as soon as possible:** the election window is time-bound, and days that aren't collected can't be backfilled.
+1. ✅ **Commit fixes.** Done: the engagement-count key (`text_post_app_info`), `reparse`, the scroll early-stop fix, field refresh on re-seen posts, and failed location lookups no longer overwrite a country.
+2. ⏳ **Verify engagement counts in the browser.** The code is fixed and `reparse` has been run on the old DB (now `threads_test.db`). Still to do: compare about 3 posts from the fresh DB against the browser.
+3. ✅ **`found_as` column.** Values are `result`, `reply`, `parent`, `quoted` and `other`, decided by the payload key a post sits under (checked against dumps of profile, search and post pages). When a post is seen in several roles, the strongest one is kept.
+4. ✅ **Simple snowball.** `snowball topics/tw2026_local.json` runs one round: keyword search → seed profiles → post pages of recent on-topic posts → profiles of repliers and on-topic authors → a capped batch of location lookups. Posts are tagged in `post_topics`, never dropped. Every page load is logged in `visits` with a `run_id`. A login wall stops the run (exit code 2), and location lookups stop after 3 failures in a row. **Seeds are still empty: KT has to add verified handles and candidate names to the topic file.**
+5. ⏳ **Scheduled re-collection.** `scripts/collect.sh` and `systemd/threads-collect.{service,timer}` run twice a day at 09:00 and 21:00, with up to 45 min random delay and missed runs caught up after wake. There is no cron on this machine, so it uses a systemd user timer. It is written but must be enabled by KT (see README). Each round re-opens on-topic posts up to 14 days old at most once per 20 h, which builds the `post_snapshots` time series.
 6. **`features.py`** (offline, can run later):
    - **Language and script:** fastText lid.176 and lingua both return plain `zh` and can't tell Traditional from Simplified Chinese. Add a script classifier on top (hanzidentifier, or character counts via OpenCC). Threads' own `detected_language` covers only about 3% of posts.
    - **Active-hours timezone** fitted from `taken_at` (needs roughly 20+ posts per user).
    - **Self-declared location** in `users.bio`.
    - Mismatches between these signals and `country` are candidate CIB features.
 
-Resolved: the location lookup clicked the sidebar's "More" button instead of the profile's; that's fixed. The current DB is mostly test data, so start a fresh DB for the demo.
+Resolved: the location lookup clicked the sidebar's "More" button instead of the profile's; that's fixed. The old test data was moved to `threads_test.db`; the demo collects into a fresh `threads.db`.
 
 ## Downstream
 The output feeds KT's existing detection and drift-monitoring pipeline: five classifiers (NB, RF, SVM, DNN, DT), with PSI/KS input drift, prediction drift, and the degradation risk score. Keep the output tabular and reproducible. Every row should be traceable to when and how it was scraped.

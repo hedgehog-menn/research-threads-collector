@@ -1,0 +1,10 @@
+{
+  "name": "tw2026_local",
+  "description": "Taiwan 2026 local elections (九合一). Election day 2026-11-28, results finalized 2026-12-04. Collect from now to mid-December.",
+  "keywords": [
+    "九合一", "地方選舉", "2026選舉", "市長選舉", "議員選舉", "投票", "催票",
+    "國民黨", "民進黨", "民眾黨", "藍白", "綠營"
+  ],
+  "seeds_todo": "Add verified Threads handles to `seeds` (without @). Keep them balanced: mayoral candidates of ALL parties in the six municipalities (台北, 新北, 桃園, 台中, 台南, 高雄); official KMT, DPP and TPP accounts; major news outlets of mixed leanings. Add candidate names to `keywords` as well.",
+  "seeds": []
+}

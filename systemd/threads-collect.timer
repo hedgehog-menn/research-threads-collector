@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Threads collector twice a day
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+OnCalendar=*-*-* 21:00:00
+# spread start times so runs don't look scripted
+RandomizedDelaySec=45min
+# run missed rounds after the laptop wakes up
+Persistent=true
+
+[Install]
+WantedBy=timers.target
