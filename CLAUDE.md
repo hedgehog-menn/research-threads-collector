@@ -10,7 +10,7 @@ Why a new dataset: the existing datasets (Pantip sockpuppets and TikTok politica
 - History: the heavy fighting was in July 2025 (Kuala Lumpur ceasefire on 2025-07-28) and December 2025 (20 days, at least 101 killed, over 500k displaced; ceasefire 2025-12-27). A tense ceasefire has held through 2026. UN-backed maritime talks began on 2026-09-15.
 - `period` is 2025-05-01 to 2026-01-31. Threads can't search by date, so history comes from (a) scrolling seed outlet profiles back to the period start (thaipbsworld reached March 2024 in 80 scrolls), (b) "top"-mode search on terms specific to those events, and (c) the post pages of old posts, which still have their replies. Posts in the period are opened once each: their engagement is final, so there's **no live drift time series** for them. Drift has to come from comparing phases by `taken_at` (before, during and after each fight).
 - Seeds (all checked as real): Thai side thaipbsworld, khaosodenglish; Cambodian side phnompenhpost (new account, only 24 recent posts, so no history), cambodianess; international reuters, apnews, aljazeeraenglish, channelnewsasia.
-- On-topic = a Cambodian-side term AND a Thai-side term (`require_any`), or a conflict-specific place name. `languages: ["en"]`. A first test showed openly partisan posts from both sides, which is good material for CIB.
+- On-topic = a Cambodian-side keyword AND a Thai-side term AND a conflict term (`require_any` holds two groups, and each must match). The conflict group was added on 2026-09-30 because travel, food and ranking posts that only named both countries were inflating the "after" phase. Generic words (fight, mine, peace, army, bomb) are left out because they match casual English ("please fight me"). A hand-check of 12 random on-topic posts found 12 of 12 relevant. `languages: ["en"]`. A first test showed openly partisan posts from both sides, which is good material for CIB.
 - KT reads English only (not Chinese). Thai and Khmer could be added later as separate topic files.
 
 Earlier topic, on hold: Taiwan 2026 local elections (`topics/tw2026_local*.json`). English content was too thin (21 on-topic posts out of 141 from two searches). The partial data is in `threads_tw_en.db`, and the older test data is in `threads_test.db`.
@@ -51,6 +51,9 @@ Verified behavior:
    - `location` lookups now also store the profile header (bio, followers) and posts, so bios are collected without extra page loads.
 
 Resolved: the location lookup clicked the sidebar's "More" button instead of the profile's; that's fixed. The old test data was moved to `threads_test.db`; the demo collects into a fresh `threads.db`.
+
+## Demo
+`scripts/make_demo.py` builds `export/demo/` (not in git): a posts-per-month chart cropped to the study period, sample posts per conflict phase, and top accounts with a repost-to-like ratio. Columns that are still empty are dropped. Re-run `tag` first if the keywords changed.
 
 ## Downstream
 The output feeds KT's existing detection and drift-monitoring pipeline: five classifiers (NB, RF, SVM, DNN, DT), with PSI/KS input drift, prediction drift, and the degradation risk score. Keep the output tabular and reproducible. Every row should be traceable to when and how it was scraped.

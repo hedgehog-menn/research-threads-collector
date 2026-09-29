@@ -309,10 +309,14 @@ class Store:
         match whole words only ("DPP" not inside "DPPs"-like tokens); CJK keywords match
         as substrings. Optional filters, all of which must pass to be on-topic
         (matched_keywords is recorded either way):
-          require_any - the post must also contain one of these (context words)
+          require_any - the post must also contain one of these (context words); a list
+                        of lists means one word from EACH group
           languages   - the post must be detected as one of these languages"""
         kws = [(k, keyword_matcher(k)) for k in topic["keywords"]]
-        ctx = [keyword_matcher(k) for k in topic.get("require_any") or []]
+        groups = topic.get("require_any") or []
+        if groups and isinstance(groups[0], str):
+            groups = [groups]
+        ctx = [[keyword_matcher(k) for k in g] for g in groups]
         langs = set(topic.get("languages") or [])
         analyzer = None
         if langs:
@@ -324,7 +328,7 @@ class Store:
         for pk, text in rows:
             hits = [k for k, match in kws if match(text or "")]
             ok = (bool(hits)
-                  and (not ctx or any(m(text or "") for m in ctx))
+                  and all(any(m(text or "") for m in g) for g in ctx)
                   and (not langs or analyzer.analyze(text)["lang"] in langs))
             on += ok
             self.db.execute(
