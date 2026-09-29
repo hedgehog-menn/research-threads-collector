@@ -301,18 +301,31 @@ class Store:
         self.db.commit()
 
     def tag_topic(self, topic: dict) -> int:
-        """Tag every post as on/off-topic by keyword (case-insensitive substring)."""
-        kws = [(k, k.lower()) for k in topic["keywords"]]
+        """Tag every post as on/off-topic by keyword, case-insensitively. ASCII keywords
+        match whole words only ("DPP" not inside "DPPs"-like tokens); CJK keywords match
+        as substrings. Optional filters, all of which must pass to be on-topic
+        (matched_keywords is recorded either way):
+          require_any - the post must also contain one of these (context words)
+          languages   - the post must be detected as one of these languages"""
+        kws = [(k, keyword_matcher(k)) for k in topic["keywords"]]
+        ctx = [keyword_matcher(k) for k in topic.get("require_any") or []]
+        langs = set(topic.get("languages") or [])
+        analyzer = None
+        if langs:
+            from features import PostAnalyzer  # lazy: only language-filtered topics need it
+            analyzer = PostAnalyzer()
         t = now()
         rows = self.db.execute("SELECT pk, text FROM posts").fetchall()
         on = 0
         for pk, text in rows:
-            low = (text or "").lower()
-            hits = [k for k, kl in kws if kl in low]
-            on += bool(hits)
+            hits = [k for k, match in kws if match(text or "")]
+            ok = (bool(hits)
+                  and (not ctx or any(m(text or "") for m in ctx))
+                  and (not langs or analyzer.analyze(text)["lang"] in langs))
+            on += ok
             self.db.execute(
                 "INSERT OR REPLACE INTO post_topics VALUES (?,?,?,?,?)",
-                (pk, topic["name"], int(bool(hits)), json.dumps(hits, ensure_ascii=False), t),
+                (pk, topic["name"], int(ok), json.dumps(hits, ensure_ascii=False), t),
             )
         self.db.commit()
         return on
@@ -581,9 +594,18 @@ def search_url(query: str, recent: bool = True) -> str:
     return url + "&filter=recent" if recent else url
 
 
+def keyword_matcher(kw: str):
+    if kw.isascii():
+        rx = re.compile(rf"(?<![a-z0-9]){re.escape(kw.lower())}(?![a-z0-9])")
+        return lambda text: bool(rx.search(text.lower()))
+    low = kw.lower()
+    return lambda text: low in text.lower()
+
+
 def load_topic(path) -> dict:
     topic = json.loads(Path(path).read_text(encoding="utf-8"))
     topic["seeds"] = [s.lstrip("@") for s in topic.get("seeds", []) if not s.startswith("#")]
+    topic.setdefault("search", topic["keywords"])  # search terms default to the tag keywords
     return topic
 
 
@@ -595,7 +617,7 @@ async def snowball(col: Collector, topic: dict, a):
     st, name = col.store, topic["name"]
     print(f"== run {col.run_id}  topic={name}")
 
-    for kw in topic["keywords"]:
+    for kw in topic["search"]:
         await col.visit(search_url(kw), f"search:{kw}", a.search_scrolls)
         await polite_pause()
     for u in topic["seeds"]:

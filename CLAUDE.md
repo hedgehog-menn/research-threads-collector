@@ -6,7 +6,7 @@ This repo collects a **new Threads dataset** for KT's master's thesis (NTHU, Ins
 Why a new dataset: the existing datasets (Pantip sockpuppets and TikTok political amplifiers) predate widespread generative-AI use. The advisor asked for fresh data, and suggested Threads.
 
 ## What to collect
-**Demo topic: Taiwan 2026 local elections (九合一).** Election day is 2026-11-28 and results are finalized 2026-12-04. The collection window runs from now to mid-December, so the data covers before, during and after the election, which is a natural setup for drift.
+**Demo topic: Taiwan 2026 local elections (九合一).** **Decision (2026-09-29): English posts first.** KT doesn't read Chinese, so the active topic is `topics/tw2026_local_en.json`: English keywords, `languages: ["en"]`, and a `require_any` Taiwan context. The Chinese topic file `topics/tw2026_local.json` is kept for later. A first test found English volume thin (21 on-topic posts out of 141 from two searches), and CIB detection needs volume, so revisit adding the Chinese topic (or collecting it in the background) before the election. Election day is 2026-11-28 and results are finalized 2026-12-04. The collection window runs from now to mid-December, so the data covers before, during and after the election, which is a natural setup for drift.
 - Language: mostly Traditional Chinese.
 - Seeds: mayoral candidates in the six municipalities from ALL parties, plus the official KMT, DPP and TPP accounts and major news outlets of mixed leanings. KT verifies the Threads handles. Seeding from one side only reproduces the one-sided sampling problem in prior work, so keep it balanced.
 - Keywords: 九合一, 地方選舉, 2026選舉, 市長選舉, 議員選舉, 投票, 催票, 國民黨, 民進黨, 民眾黨, 藍白, 綠營, plus candidate names.

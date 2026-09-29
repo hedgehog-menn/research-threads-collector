@@ -54,7 +54,15 @@ Search loads about 3 results per scroll, so use a high `--scrolls` value (for ex
 
 ### Topic collection (snowball)
 
-A topic file (`topics/*.json`) lists `keywords` and `seeds` (Threads handles without `@`). One `snowball` round:
+A topic file (`topics/*.json`) has these fields:
+
+- `keywords`: words that mark a post as on-topic. English (ASCII) keywords match whole words only, case-insensitively. Chinese keywords match anywhere in the text.
+- `search` (optional): the terms to search for. Defaults to `keywords`. Use specific phrases here, because a bare "DPP" search returns a flood of unrelated posts.
+- `require_any` (optional): a post must also contain one of these context words. For example, "DPP" only counts next to "Taiwan", "Taipei" and so on, which excludes Kenya's Director of Public Prosecutions.
+- `languages` (optional): a post must also be detected as one of these languages, using `features.py`'s detector. `["en"]` keeps Chinese posts that mention "KMT" off-topic.
+- `seeds`: Threads handles without `@`
+
+Two topics exist: `tw2026_local_en.json` (English, the current focus) and `tw2026_local.json` (Traditional Chinese). One `snowball` round:
 
 1. searches each keyword (recent posts) and opens each seed profile
 2. opens the post pages of recent on-topic posts that have replies, to collect the replies
@@ -67,7 +75,7 @@ The run stops at a login wall (exit code 2) and stops location lookups after 3 f
 
 ### Scheduled collection
 
-`systemd/` has a user timer that runs `scripts/collect.sh` twice a day (09:00 and 21:00, with a random delay of up to 45 min). Missed runs happen after the laptop wakes. Logs go to `logs/YYYY-MM-DD.log`. To enable it:
+`systemd/` has a user timer that runs `scripts/collect.sh` twice a day (09:00 and 21:00, with a random delay of up to 45 min). Missed runs happen after the laptop wakes. The script collects `topics/tw2026_local_en.json` by default. To add the Chinese topic, set `THREADS_TOPICS="topics/tw2026_local_en.json topics/tw2026_local.json"` in the script or the service file. Each topic adds about an hour per round. Logs go to `logs/YYYY-MM-DD.log`. To enable it:
 
 ```zsh
 mkdir -p ~/.config/systemd/user

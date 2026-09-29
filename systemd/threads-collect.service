@@ -1,5 +1,5 @@
 [Unit]
-Description=Threads collector: one snowball round (tw2026_local)
+Description=Threads collector: one snowball round per topic
 After=network-online.target
 
 [Service]
