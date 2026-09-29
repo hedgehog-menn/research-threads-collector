@@ -59,6 +59,11 @@
     "KMT",
     "Kuomintang"
   ],
-  "seeds_todo": "Add verified Threads handles to `seeds` (without @). English-language candidates: Focus Taiwan (CNA English), Taipei Times, Taiwan News, TaiwanPlus, plus foreign correspondents covering Taiwan. Keep leanings mixed. Add candidate names (romanized) to `keywords` once confirmed. Bare \"TPP\" is left out on purpose: it also means the Trans-Pacific Partnership.",
-  "seeds": []
+  "seeds_todo": "Seeds need balance: add verified handles of other English-language outlets and commentators of mixed leanings, plus candidate names (romanized) to `keywords`. Checked 2026-09-29: @taiwannews_ is the real Taiwan News account (21.7k followers, links to taiwannews.com.tw). @focus_taiwan is NOT Focus Taiwan (1 follower, no posts). @taiwanplusnews exists (TaiwanPlus News, 4.3k followers) but returned no posts. @focustaiwan, @taipeitimes and @taiwannews don't exist. Bare \"TPP\" is left out of keywords on purpose: it also means the Trans-Pacific Partnership. exclude_users: accounts whose posts are kept but never opened as profiles or location-checked (meta.ai is Meta's AI bot replying to users).",
+  "seeds": [
+    "taiwannews_"
+  ],
+  "exclude_users": [
+    "meta.ai"
+  ]
 }

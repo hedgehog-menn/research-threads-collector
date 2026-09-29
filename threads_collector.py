@@ -606,6 +606,7 @@ def load_topic(path) -> dict:
     topic = json.loads(Path(path).read_text(encoding="utf-8"))
     topic["seeds"] = [s.lstrip("@") for s in topic.get("seeds", []) if not s.startswith("#")]
     topic.setdefault("search", topic["keywords"])  # search terms default to the tag keywords
+    topic["exclude_users"] = [u.lstrip("@") for u in topic.get("exclude_users", [])]
     return topic
 
 
@@ -658,8 +659,10 @@ async def snowball(col: Collector, topic: dict, a):
            SELECT username FROM parts
            WHERE username NOT IN (SELECT target FROM visits WHERE kind = 'profile'
                                   AND status = 'ok' AND started_at >= ?)
+             AND username NOT IN (SELECT value FROM json_each(?))
            GROUP BY username ORDER BY COUNT(*) DESC LIMIT ?""",
-        (name, now() - a.profile_revisit_days * 86400, a.max_profiles))]
+        (name, now() - a.profile_revisit_days * 86400, json.dumps(topic["exclude_users"]),
+         a.max_profiles))]
     for u in users:
         await col.visit(f"{BASE}/@{u}", f"profile:{u}", a.profile_scrolls)
         await polite_pause()
@@ -671,8 +674,9 @@ async def snowball(col: Collector, topic: dict, a):
                  ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1
                JOIN users u ON u.pk = p.user_pk
                WHERE u.country_checked_at IS NULL
+                 AND p.username NOT IN (SELECT value FROM json_each(?))
                GROUP BY p.username ORDER BY COUNT(*) DESC LIMIT ?""",
-            (name, a.max_locations))]
+            (name, json.dumps(topic["exclude_users"]), a.max_locations))]
         await col.locations(todo)
 
     row = st.db.execute(

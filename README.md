@@ -61,6 +61,7 @@ A topic file (`topics/*.json`) has these fields:
 - `require_any` (optional): a post must also contain one of these context words. For example, "DPP" only counts next to "Taiwan", "Taipei" and so on, which excludes Kenya's Director of Public Prosecutions.
 - `languages` (optional): a post must also be detected as one of these languages, using `features.py`'s detector. `["en"]` keeps Chinese posts that mention "KMT" off-topic.
 - `seeds`: Threads handles without `@`
+- `exclude_users` (optional): accounts whose posts are kept but never opened as profiles or location-checked, such as `meta.ai`, Meta's AI bot that replies to users
 
 Two topics exist: `tw2026_local_en.json` (English, the current focus) and `tw2026_local.json` (Traditional Chinese). One `snowball` round:
 
