@@ -1,0 +1,3 @@
+playwright
+lingua-language-detector
+hanzidentifier

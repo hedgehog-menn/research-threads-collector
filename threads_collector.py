@@ -458,6 +458,14 @@ class Collector:
         for obj in parse_payload(body):
             extract(obj, self.store, self.source)
 
+    async def _ingest_inline(self):
+        scripts = await self.page.eval_on_selector_all(
+            'script[type="application/json"]', "els => els.map(e => e.textContent)"
+        )
+        for s in scripts:
+            if s and ("taken_at" in s or "username" in s):
+                self._ingest(s, "inline")
+
     async def _drain(self):
         if self.pending:
             await asyncio.gather(*list(self.pending), return_exceptions=True)
@@ -490,12 +498,7 @@ class Collector:
             print(f"[{source}] redirected to login wall - session expired? run `login` again ({url})")
             raise LoginWall(url)
 
-        scripts = await self.page.eval_on_selector_all(
-            'script[type="application/json"]', "els => els.map(e => e.textContent)"
-        )
-        for s in scripts:
-            if s and ("taken_at" in s or "username" in s):
-                self._ingest(s, "inline")
+        await self._ingest_inline()
 
         idle = 0
         for _ in range(scrolls):
@@ -520,6 +523,11 @@ class Collector:
         if "/login" in self.page.url:
             self.store.log_visit(self.run_id, "location", username, started, 0, 0, "login_wall")
             raise LoginWall(username)
+        # the profile page is loaded anyway: keep its header (bio, followers) and posts
+        self.source = f"location:{username}"
+        await self._ingest_inline()
+        await self._drain()
+        self.store.commit()
         try:
             # Several "More" buttons exist (the sidebar one opens Settings); try each until
             # one opens a menu containing "About this profile".

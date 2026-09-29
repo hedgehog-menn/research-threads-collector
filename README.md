@@ -7,7 +7,7 @@ Collects Threads posts, users and profile locations for research. It uses Playwr
 ```zsh
 conda create -n threads-scraper python=3.12
 conda activate threads-scraper
-pip install playwright
+python -m pip install -r requirements.txt
 playwright install chromium
 ```
 
@@ -141,6 +141,29 @@ WHERE t.on_topic = 1 AND p.found_as IN ('result', 'reply');
 SELECT run_id, kind, COUNT(*), SUM(new_posts), SUM(status != 'ok') AS problems
 FROM visits GROUP BY run_id, kind;
 ```
+
+## Location-proxy features (`features.py`)
+
+`country` ("Based in") is often hidden, so `features.py` computes three independent location signals offline and flags where they disagree with `country`. The flags are **candidate CIB features, not labels**.
+
+```zsh
+python features.py                          # reads and writes threads.db
+python features.py --csv features_out/      # also export CSVs
+```
+
+It needs no browser and can run at any time. Each run replaces the `post_features` and `user_features` tables, and every row carries `features_version` and `computed_at`.
+
+**`post_features`** (one row per post)
+- `lang`: the writing system decides first (Han → `zh`, any kana → `ja`, Hangul → `ko`, Thai → `th`, Khmer → `km`). Only Latin-script text is passed to Lingua, and only when it has at least 12 letters. Lingua has no Khmer, and it guesses wildly on short non-Latin snippets. Otherwise the value is `und` (for example emoji-only) or `und-<script>`.
+- `n_han`, `n_trad_only`, `n_simp_only`: Han characters, and those that exist only in Traditional or only in Simplified (via `hanzidentifier`). Many characters are shared, so a short post is often `both`.
+- `zh_variant`: `traditional`, `simplified`, `both` or `mixed`, for the whole post
+
+**`user_features`** (one row per user)
+- `simp_share` = Simplified-only chars / (Traditional-only + Simplified-only), summed over all the user's posts. It needs at least 20 such characters, and is NULL below that.
+- `top_lang`, `top_lang_share`
+- `tz_offset`: the UTC offset that best fits the user's posting hours to a generic daily rhythm (quiet at 03:00–05:00 local, busiest in the evening). It needs 20 or more posts. `tz_margin` is the confidence: near 0 means there is no clear daily rhythm, which is typical of schedulers, bots and shared accounts. `tz_quiet_share` is the share of posts made between 01:00 and 07:00 local. Accuracy is about ±2 h with 20–30 posts, and Taiwan and China are both UTC+8, so this signal **cannot separate TW from CN**. It catches accounts that post on another continent's rhythm, or with no rhythm at all.
+- `bio_country`, `bio_term`: the first place name or flag emoji in the bio, from a small list (`BIO_PLACES`). "中國" alone is deliberately not a China term, because it appears in 中國國民黨 and 中國文化大學. Bios are only collected for profiles that were opened (by `profile`, `snowball` or `location`).
+- `flag_bio_vs_country`, `flag_tz_vs_country` (only when `tz_margin` ≥ 0.05, with 2 h of slack), `flag_simplified_in_taiwan` (`country` is Taiwan and `simp_share` > 0.5)
 
 ## Troubleshooting
 
