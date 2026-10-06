@@ -12,7 +12,7 @@ code=0
 for topic in $TOPICS; do
   {
     echo "=== $(date -Is) start $topic"
-    "$PY" threads_collector.py snowball "$topic"
+    "$PY" -u threads_collector.py snowball "$topic"
     code=$?
     echo "=== $(date -Is) exit $code"
   } >>"$LOG" 2>&1
