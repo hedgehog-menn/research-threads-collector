@@ -450,6 +450,23 @@ class LoginWall(Exception):
     """Session expired or blocked: stop the whole run instead of hammering the site."""
 
 
+class TooManyFailures(Exception):
+    """Several page visits in a row failed or timed out: stop the run (protect the account)."""
+
+
+# Time limits, so a stuck page can never hang a run (a round once froze for 32 h waiting
+# on one response). Values are generous: they only fire when something is really stuck.
+RESPONSE_TIMEOUT_S = 30   # reading one /graphql response body
+DRAIN_TIMEOUT_S = 30      # waiting for all pending responses after a scroll
+LOCATION_TIMEOUT_S = 120  # one whole "About this profile" lookup
+MAX_VISIT_FAILURES = 3    # consecutive failed/timed-out visits before the run stops
+
+
+def visit_timeout(scrolls: int) -> int:
+    """Upper bound for one page visit: load + per-scroll wait (max 3.5 s) + drain, x2 slack."""
+    return 120 + scrolls * 2 * (4 + DRAIN_TIMEOUT_S // 6)
+
+
 class Collector:
     def __init__(self, page, store: Store, dump_dir: Path | None, run_id: str = ""):
         self.page, self.store, self.dump_dir = page, store, dump_dir
@@ -457,6 +474,7 @@ class Collector:
         self.source = ""
         self.pending: set[asyncio.Task] = set()
         self.dump_n = 0
+        self.failures = 0  # consecutive failed visits
         page.on("response", self._on_response)
 
     def _on_response(self, resp):
@@ -467,8 +485,8 @@ class Collector:
 
     async def _handle(self, resp):
         try:
-            body = await resp.text()
-        except Exception:
+            body = await asyncio.wait_for(resp.text(), RESPONSE_TIMEOUT_S)
+        except Exception:  # includes TimeoutError: a body that never finishes is dropped
             return
         self._ingest(body, "gql")
 
@@ -489,23 +507,32 @@ class Collector:
 
     async def _drain(self):
         if self.pending:
-            await asyncio.gather(*list(self.pending), return_exceptions=True)
+            _, stuck = await asyncio.wait(list(self.pending), timeout=DRAIN_TIMEOUT_S)
+            for task in stuck:
+                task.cancel()
 
     async def visit(self, url: str, source: str, scrolls: int, stop_before: int | None = None):
         kind, _, target = source.partition(":")
         started, start_new, start_seen = now(), self.store.new_posts, self.store.seen_posts
         try:
-            await self._visit(url, source, scrolls, stop_before)
+            await asyncio.wait_for(self._visit(url, source, scrolls, stop_before),
+                                   visit_timeout(scrolls))
         except LoginWall:
             self.store.log_visit(self.run_id, kind, target, started, 0, 0, "login_wall")
             raise
         except Exception as e:
+            # keep what was collected before the failure
+            status = "timeout" if isinstance(e, TimeoutError) else f"error:{type(e).__name__}"
             self.store.commit()
             self.store.log_visit(self.run_id, kind, target, started,
                                  self.store.new_posts - start_new,
-                                 self.store.seen_posts - start_seen, f"error:{type(e).__name__}")
-            print(f"[{source}] failed: {type(e).__name__}: {e}")
+                                 self.store.seen_posts - start_seen, status)
+            print(f"[{source}] failed: {status} {e}")
+            self.failures += 1
+            if self.failures >= MAX_VISIT_FAILURES:
+                raise TooManyFailures(f"{self.failures} page visits in a row failed")
             return
+        self.failures = 0
         self.store.log_visit(self.run_id, kind, target, started,
                              self.store.new_posts - start_new,
                              self.store.seen_posts - start_seen, "ok")
@@ -600,7 +627,13 @@ class Collector:
         which usually means Threads is blocking (protect the account)."""
         fails = 0
         for u in usernames:
-            fails = 0 if await self.fetch_country(u.lstrip("@")) else fails + 1
+            try:
+                ok = await asyncio.wait_for(self.fetch_country(u.lstrip("@")), LOCATION_TIMEOUT_S)
+            except TimeoutError:
+                print(f"[location] @{u}: timed out after {LOCATION_TIMEOUT_S} s")
+                self.store.log_visit(self.run_id, "location", u.lstrip("@"), now(), 0, 0, "timeout")
+                ok = False
+            fails = 0 if ok else fails + 1
             if fails >= max_failures:
                 print(f"[location] {fails} failures in a row - stopping to protect the account")
                 return
@@ -857,6 +890,11 @@ async def run(args):
             store.commit()
             await browser.close()
             raise SystemExit(2)
+        except TooManyFailures as e:
+            print(f"stopped: {e} - Threads may be blocking or the network is down.")
+            store.commit()
+            await browser.close()
+            raise SystemExit(3)
 
         store.commit()
         await browser.close()

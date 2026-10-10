@@ -57,6 +57,8 @@ Verified behavior:
    - Snowball location lookups prioritize members of cross-account copy clusters (among on-topic posts), then the most active on-topic authors.
    - **Framing (agreed 2026-09-30):** clusters are *coordination* evidence only. *Inauthenticity* needs account-level signals (age, rhythm, country/bio mismatch, shop-named accounts posting politics). Keep them as separate feature groups (listed in README), which is also the frame for the labeling discussion with the professor.
 
+Resolved 2026-10-10: a round froze for 32 h (no sleep, network fine) waiting on something with no time limit. Responses, response draining, whole page visits and location lookups now all have timeouts (logged as `timeout`), and 3 failed visits in a row stop the run (exit code 3). Separately, an earlier round paused for 2.2 days because the laptop auto-suspended: keep it awake during runs.
+
 Resolved: the location lookup clicked the sidebar's "More" button instead of the profile's; that's fixed. The old test data was moved to `threads_test.db`; the demo collects into a fresh `threads.db`.
 
 ## Demo

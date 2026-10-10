@@ -79,7 +79,9 @@ One `snowball` round:
 
 Every stage has a limit (`--max-post-pages`, `--max-profiles`, `--max-locations` and the `--*-scrolls` options; see `snowball -h`). A default round takes about an hour. Re-running is safe: post pages are re-opened at most once per 20 h, for posts up to 14 days old, which builds the engagement time series in `post_snapshots`. Profiles are re-opened at most once a week.
 
-The run stops at a login wall (exit code 2) and stops location lookups after 3 failures in a row, to protect the account.
+The run stops at a login wall (exit code 2), and also after 3 failed or timed-out page visits in a row (exit code 3). Location lookups stop after 3 failures in a row, to protect the account. Every wait has a time limit: 30 s per network response, 30 s for pending responses after a scroll, a per-visit limit based on the scroll count, and 2 min per location lookup. A stuck page can't freeze a run; its visit is logged as `timeout` and the run moves on.
+
+Keep the laptop awake during long runs: if it sleeps, collection pauses until it wakes.
 
 ### Scheduled collection
 
