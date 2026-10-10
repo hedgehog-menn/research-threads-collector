@@ -612,7 +612,14 @@ class Collector:
             await about.click(timeout=6000)
             dialog = self.page.get_by_role("dialog").last
             await dialog.wait_for(timeout=8000)
-            await self.page.wait_for_timeout(1500)
+            # The rows load in after the dialog opens; reading after a fixed delay cut some
+            # off right after "Joined". Wait for the "Based in" row, but accept its absence
+            # (some profiles really have none) once the wait runs out.
+            try:
+                await dialog.get_by_text(re.compile(r"Based in", re.I)).first.wait_for(timeout=8000)
+            except Exception:
+                pass
+            await self.page.wait_for_timeout(1000)
             text = await dialog.inner_text()
         except Exception as e:
             self.store.set_country(username, None, f"ui_error:{type(e).__name__}")
