@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS users (
     country TEXT,
     country_raw TEXT,
     country_checked_at INTEGER,
+    lookup_reason TEXT,  -- why the location lookup chose this user: cluster / random
     first_seen INTEGER,
     last_seen INTEGER
 );
@@ -148,6 +149,7 @@ POST_MIGRATIONS = {
     "self_thread_pos": "INTEGER", "self_thread_length": "INTEGER", "is_edited": "INTEGER",
     "ai_label": "TEXT", "last_scraped_at": "INTEGER", "found_as": "TEXT",
 }
+USER_MIGRATIONS = {"lookup_reason": "TEXT"}
 
 MEDIA_TYPES = {1: "image", 2: "video", 8: "carousel", 19: "text"}
 
@@ -205,6 +207,10 @@ class Store:
         for col, typ in POST_MIGRATIONS.items():
             if have and col not in have:
                 self.db.execute(f"ALTER TABLE posts ADD COLUMN {col} {typ}")
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(users)")}
+        for col, typ in USER_MIGRATIONS.items():
+            if have and col not in have:
+                self.db.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
         self.db.executescript(SCHEMA)
         self.keep_raw = keep_raw
         self.thread_pos: dict[str, tuple[str, int]] = {}
@@ -672,6 +678,35 @@ def load_topic(path) -> dict:
     return topic
 
 
+def pick_lookups(st: "Store", topic: dict, run_id: str, n: int):
+    """Choose up to n users for location lookups: half copy-cluster members, half a random
+    sample of other on-topic authors (seeded with run_id). Records users.lookup_reason."""
+    from features import text_clusters  # lazy: keeps the collector light otherwise
+    on_rows = st.db.execute(
+        """SELECT p.pk, p.username, p.text, p.taken_at FROM posts p JOIN post_topics t
+             ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1""", (topic["name"],)).fetchall()
+    in_clusters = {u for c in text_clusters(on_rows) if c["n_accounts"] >= 2
+                   for u in json.loads(c["usernames"])}
+    candidates = st.db.execute(
+        """SELECT p.username, COUNT(*) FROM posts p JOIN post_topics t
+             ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1
+           JOIN users u ON u.pk = p.user_pk
+           WHERE u.country_checked_at IS NULL
+             AND p.username NOT IN (SELECT value FROM json_each(?))
+           GROUP BY p.username ORDER BY p.username""",
+        (topic["name"], json.dumps(topic["exclude_users"]))).fetchall()
+    clustered = sorted((r for r in candidates if r[0] in in_clusters), key=lambda r: -r[1])
+    others = [r[0] for r in candidates if r[0] not in in_clusters]
+    n_cluster = min(len(clustered), n // 2)
+    n_random = min(len(others), n - n_cluster)
+    picks = [(u, "cluster") for u, _ in clustered[:n_cluster]]
+    picks += [(u, "random") for u in random.Random(run_id).sample(others, n_random)]
+    st.db.executemany("UPDATE users SET lookup_reason = ? WHERE username = ?",
+                      [(why, u) for u, why in picks])
+    st.commit()
+    return picks
+
+
 async def snowball(col: Collector, topic: dict, a):
     """One collection round: keyword search + seed profiles -> post pages of on-topic
     posts (replies) -> repliers' profiles -> a capped batch of location lookups.
@@ -755,26 +790,17 @@ async def snowball(col: Collector, topic: dict, a):
 
     if a.max_locations:
         # Account-level evidence (country, join date) only exists for looked-up users and the
-        # batch is capped, so look up the accounts we most need to judge first: members of
-        # cross-account copy clusters among on-topic posts, then the most active authors.
-        from features import text_clusters  # lazy: keeps the collector light otherwise
-        on_rows = st.db.execute(
-            """SELECT p.pk, p.username, p.text, p.taken_at FROM posts p JOIN post_topics t
-                 ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1""", (name,)).fetchall()
-        in_clusters = {u for c in text_clusters(on_rows) if c["n_accounts"] >= 2
-                       for u in json.loads(c["usernames"])}
-        candidates = st.db.execute(
-            """SELECT p.username, COUNT(*) FROM posts p JOIN post_topics t
-                 ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1
-               JOIN users u ON u.pk = p.user_pk
-               WHERE u.country_checked_at IS NULL
-                 AND p.username NOT IN (SELECT value FROM json_each(?))
-               GROUP BY p.username""",
-            (name, json.dumps(topic["exclude_users"]))).fetchall()
-        candidates.sort(key=lambda r: (r[0] not in in_clusters, -r[1]))
-        todo = [u for u, _ in candidates[:a.max_locations]]
-        print(f"location lookups: {len(todo)} "
-              f"({sum(u in in_clusters for u in todo)} copy-cluster members first)")
+        # batch is capped. Split it: half to members of cross-account copy clusters (the
+        # accounts we most need to judge), half to a RANDOM sample of the other on-topic
+        # authors (a fair baseline - looking up only cluster members skewed the country mix).
+        # lookup_reason records which half each user came from; the random draw is seeded
+        # with the run id so it can be reproduced.
+        picks = pick_lookups(st, topic, col.run_id, a.max_locations)
+        n_cluster = sum(why == "cluster" for _, why in picks)
+        n_random = len(picks) - n_cluster
+        todo = [u for u, _ in picks]
+        print(f"location lookups: {len(todo)} ({n_cluster} copy-cluster members, "
+              f"{n_random} random on-topic authors)")
         await col.locations(todo)
 
     row = st.db.execute(

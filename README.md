@@ -75,7 +75,7 @@ One `snowball` round:
 1. searches each keyword (recent posts) and opens each seed profile
 2. opens the post pages of recent on-topic posts that have replies, to collect the replies
 3. opens the profiles of repliers and on-topic authors, most active first
-4. looks up the country (and join date) of up to `--max-locations` on-topic authors: members of cross-account copy clusters first, then the most active authors, since account-level evidence only exists for looked-up users
+4. looks up the country (and join date) of up to `--max-locations` on-topic authors, split in half: members of cross-account copy clusters (the accounts most worth judging), and a **random** sample of the other on-topic authors (a fair baseline). `users.lookup_reason` records `cluster` or `random`; the draw is seeded with the run ID. Lookups made before this split have no reason and were prioritized, not random, so don't use them as a representative sample
 
 Every stage has a limit (`--max-post-pages`, `--max-profiles`, `--max-locations` and the `--*-scrolls` options; see `snowball -h`). A default round takes about an hour. Re-running is safe: post pages are re-opened at most once per 20 h, for posts up to 14 days old, which builds the engagement time series in `post_snapshots`. Profiles are re-opened at most once a week.
 

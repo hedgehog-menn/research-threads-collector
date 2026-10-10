@@ -91,6 +91,17 @@ def main():
               f"no Based-in row {pct(no_row, n)}; ui_error {pct(err, n)}")
     loc("", "all checked users")
     loc(f"AND u.pk IN (SELECT p.user_pk FROM posts p {ON})", "on-topic authors")
+    has_reason = any(c[1] == "lookup_reason" for c in q("PRAGMA table_info(users)"))
+    if has_reason:
+        print("by why the account was looked up (only 'random' is a fair sample of on-topic authors):")
+        for why, n, n_c in q("""SELECT COALESCE(lookup_reason, 'before split (prioritized)'), COUNT(*),
+                                       SUM(country IS NOT NULL) FROM users
+                                WHERE country_checked_at IS NOT NULL GROUP BY 1"""):
+            top = q("""SELECT country, COUNT(*) FROM users WHERE country_checked_at IS NOT NULL
+                       AND COALESCE(lookup_reason, 'before split (prioritized)') = ? AND country IS NOT NULL
+                       GROUP BY 1 ORDER BY 2 DESC LIMIT 4""", why)
+            print(f"  {why}: {n} checked, {n_c} with country; top: "
+                  + ", ".join(f"{c} {k}" for c, k in top))
     print("top countries (on-topic authors):")
     for c, n in q(f"""SELECT country, COUNT(*) FROM users u WHERE country IS NOT NULL
                       AND u.pk IN (SELECT p.user_pk FROM posts p {ON})
