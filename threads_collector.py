@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS post_topics (
     on_topic INTEGER,
     matched_keywords TEXT,
     tagged_at INTEGER,
+    match TEXT,  -- why on-topic: keywords / thread (reply under an on-topic post)
     PRIMARY KEY (post_pk, topic)
 );
 """
@@ -150,6 +151,7 @@ POST_MIGRATIONS = {
     "ai_label": "TEXT", "last_scraped_at": "INTEGER", "found_as": "TEXT",
 }
 USER_MIGRATIONS = {"lookup_reason": "TEXT"}
+TOPIC_MIGRATIONS = {"match": "TEXT"}
 
 MEDIA_TYPES = {1: "image", 2: "video", 8: "carousel", 19: "text"}
 
@@ -211,6 +213,10 @@ class Store:
         for col, typ in USER_MIGRATIONS.items():
             if have and col not in have:
                 self.db.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(post_topics)")}
+        for col, typ in TOPIC_MIGRATIONS.items():
+            if have and col not in have:
+                self.db.execute(f"ALTER TABLE post_topics ADD COLUMN {col} {typ}")
         self.db.executescript(SCHEMA)
         self.keep_raw = keep_raw
         self.thread_pos: dict[str, tuple[str, int]] = {}
@@ -311,13 +317,20 @@ class Store:
         self.db.commit()
 
     def tag_topic(self, topic: dict) -> int:
-        """Tag every post as on/off-topic by keyword, case-insensitively. ASCII keywords
-        match whole words only ("DPP" not inside "DPPs"-like tokens); CJK keywords match
-        as substrings. Optional filters, all of which must pass to be on-topic
-        (matched_keywords is recorded either way):
-          require_any - the post must also contain one of these (context words); a list
-                        of lists means one word from EACH group
-          languages   - the post must be detected as one of these languages"""
+        """Tag every post as on/off-topic. Returns the number of on-topic posts.
+
+        keywords   - case-insensitive; ASCII keywords match whole words only, CJK ones
+                     as substrings. matched_keywords is recorded either way.
+        require_any - the post must also contain one of these (context words); a list of
+                     lists means one word from EACH group
+        languages  - ORIGINAL posts (is_reply = 0) must be detected as one of these.
+                     Replies that match the keywords count in any language.
+        reply_scope - "thread": a reply found on the post page of an on-topic post is
+                     on-topic too, in any language and without keywords (replies are often
+                     short or in Thai/Khmer). The link is posts.source = 'post:<url>' -
+                     replies are only collected from that page's reply section, and the
+                     reply payload itself carries no parent post id.
+        post_topics.match records why: "keywords" or "thread"."""
         kws = [(k, keyword_matcher(k)) for k in topic["keywords"]]
         groups = topic.get("require_any") or []
         if groups and isinstance(groups[0], str):
@@ -328,21 +341,30 @@ class Store:
         if langs:
             from features import PostAnalyzer  # lazy: only language-filtered topics need it
             analyzer = PostAnalyzer()
-        t = now()
-        rows = self.db.execute("SELECT pk, text FROM posts").fetchall()
-        on = 0
-        for pk, text in rows:
+        t, name = now(), topic["name"]
+        rows = self.db.execute("SELECT pk, text, is_reply, url, source, found_as FROM posts").fetchall()
+        result = {}  # pk -> (on_topic, matched keywords, match)
+        on_urls = set()
+        for pk, text, is_reply, url, _, _ in rows:
             hits = [k for k, match in kws if match(text or "")]
             ok = (bool(hits)
                   and all(any(m(text or "") for m in g) for g in ctx)
-                  and (not langs or analyzer.analyze(text)["lang"] in langs))
-            on += ok
-            self.db.execute(
-                "INSERT OR REPLACE INTO post_topics VALUES (?,?,?,?,?)",
-                (pk, topic["name"], int(ok), json.dumps(hits, ensure_ascii=False), t),
-            )
+                  and (is_reply or not langs or analyzer.analyze(text)["lang"] in langs))
+            result[pk] = (int(ok), hits, "keywords" if ok else None)
+            if ok and url:
+                on_urls.add(url)
+        if topic.get("reply_scope") == "thread":
+            for pk, _, _, _, source, found_as in rows:
+                if (found_as == "reply" and not result[pk][0] and source
+                        and source.startswith("post:") and source[5:] in on_urls):
+                    result[pk] = (1, result[pk][1], "thread")
+        self.db.executemany(
+            """INSERT OR REPLACE INTO post_topics(post_pk, topic, on_topic, matched_keywords,
+                                                  tagged_at, match) VALUES (?,?,?,?,?,?)""",
+            [(pk, name, ok, json.dumps(hits, ensure_ascii=False), t, why)
+             for pk, (ok, hits, why) in result.items()])
         self.db.commit()
-        return on
+        return sum(ok for ok, _, _ in result.values())
 
     def commit(self):
         self.db.commit()

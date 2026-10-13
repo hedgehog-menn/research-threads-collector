@@ -59,7 +59,8 @@ A topic file (`topics/*.json`) has these fields:
 - `keywords`: words that mark a post as on-topic. English (ASCII) keywords match whole words only, case-insensitively. Chinese keywords match anywhere in the text.
 - `search` (optional): the terms to search for. Defaults to `keywords`. Use specific phrases here, because a bare "DPP" search returns a flood of unrelated posts.
 - `require_any` (optional): a post must also contain one of these context words. For example, "DPP" only counts next to "Taiwan", "Taipei" and so on, which excludes Kenya's Director of Public Prosecutions.
-- `languages` (optional): a post must also be detected as one of these languages, using `features.py`'s detector. `["en"]` keeps Chinese posts that mention "KMT" off-topic.
+- `languages` (optional): an **original** post (not a reply) must also be detected as one of these languages, using `features.py`'s detector. `["en"]` keeps Chinese posts that mention "KMT" off-topic. Replies that match the keywords count in any language.
+- `reply_scope` (optional): `"thread"` makes every reply found on the post page of an on-topic post on-topic too, in **any language and without keywords**. Replies are often short, emoji-only, or in Thai or Khmer. The link is `posts.source` = `post:<url of that post>`; the reply data itself has no parent post ID. `post_topics.match` records why a post is on-topic: `keywords` or `thread`.
 - `seeds`: Threads handles without `@`
 - `search_modes` (optional): `["recent"]` (the default, newest first) and/or `["top"]` (Threads' own ranking, which surfaces older posts)
 - `peaks` (optional): months of peak events, such as `["2025-07", "2025-12"]`, used by `features.py --topic`

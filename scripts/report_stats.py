@@ -41,6 +41,12 @@ def main():
     total = one("SELECT COUNT(*) FROM posts")
     print(f"posts (all): {total}")
     print(f"  on-topic: {one(f'SELECT COUNT(*) FROM posts p {ON}')}")
+    has_match = any(c[1] == "match" for c in q("PRAGMA table_info(post_topics)"))
+    if has_match:
+        for why, n in q(f"SELECT COALESCE(t.match, 'keywords'), COUNT(*) FROM posts p {ON} GROUP BY 1"):
+            label = {"keywords": "by keywords (English originals + keyword-matching replies)",
+                     "thread": "replies under on-topic posts (any language)"}.get(why, why)
+            print(f"    {label}: {n}")
     print(f"  replies (is_reply=1): {one('SELECT COUNT(*) FROM posts WHERE is_reply=1')}")
     for fa, n in q("SELECT found_as, COUNT(*) FROM posts GROUP BY 1 ORDER BY 2 DESC"):
         print(f"  found_as={fa}: {n}")
