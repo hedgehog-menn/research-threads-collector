@@ -111,7 +111,9 @@ CREATE TABLE IF NOT EXISTS visits (
     finished_at INTEGER,
     new_posts INTEGER,
     seen_posts INTEGER,
-    status TEXT         -- ok / login_wall / ui_error / error
+    status TEXT,        -- ok / login_wall / ui_error / error / timeout
+    n_responses INTEGER -- /graphql responses carrying posts during the visit (0 on a
+                        -- reply page = no reply batches loaded: likely throttled)
 );
 CREATE INDEX IF NOT EXISTS idx_visits_target ON visits(kind, target);
 
@@ -152,6 +154,7 @@ POST_MIGRATIONS = {
 }
 USER_MIGRATIONS = {"lookup_reason": "TEXT"}
 TOPIC_MIGRATIONS = {"match": "TEXT"}
+VISIT_MIGRATIONS = {"n_responses": "INTEGER"}
 
 MEDIA_TYPES = {1: "image", 2: "video", 8: "carousel", 19: "text"}
 
@@ -213,6 +216,10 @@ class Store:
         for col, typ in USER_MIGRATIONS.items():
             if have and col not in have:
                 self.db.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(visits)")}
+        for col, typ in VISIT_MIGRATIONS.items():
+            if have and col not in have:
+                self.db.execute(f"ALTER TABLE visits ADD COLUMN {col} {typ}")
         have = {r[1] for r in self.db.execute("PRAGMA table_info(post_topics)")}
         for col, typ in TOPIC_MIGRATIONS.items():
             if have and col not in have:
@@ -309,10 +316,11 @@ class Store:
             )
         self.db.commit()
 
-    def log_visit(self, run_id, kind, target, started, new, seen, status):
+    def log_visit(self, run_id, kind, target, started, new, seen, status, n_responses=None):
         self.db.execute(
-            "INSERT INTO visits VALUES (?,?,?,?,?,?,?,?)",
-            (run_id, kind, target, started, now(), new, seen, status),
+            """INSERT INTO visits(run_id, kind, target, started_at, finished_at, new_posts,
+                                  seen_posts, status, n_responses) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (run_id, kind, target, started, now(), new, seen, status, n_responses),
         )
         self.db.commit()
 
@@ -493,8 +501,15 @@ MAX_VISIT_FAILURES = 3    # consecutive failed/timed-out visits before the run s
 # Reply pages
 LIVE_POST_SCROLLS = 10      # live topics re-open pages often, so a shallow pass is enough
 HISTORY_POST_SCROLLS = 40   # historical pages are opened rarely: go deep (10 got ~39%)
-REPLY_COMPLETE = 0.8        # historical page counts as done at this share of reply_count
+REPLY_COMPLETE = 0.8        # re-open a throttled historical page only if below this share
 MAX_HISTORY_OPENS = 3       # give up on a page after this many opens
+# Threads shows only part of the replies it counts (about 1 in 6 on big threads, in both
+# "Top" and "Recent" order; the rest are nested or hidden), so reply_count can't define
+# "complete". A page is done once a visit loaded reply batches; it's re-opened only when
+# the visit loaded none (n_responses = 0), which means reply loading was throttled.
+INLINE_REPLIES = 15         # a page with more replies than this should load reply batches
+THROTTLE_STREAK = 3         # this many reply pages in a row with no batches = throttled
+THROTTLE_PAUSE_S = 600      # back off this long the first time; skip the rest the second
 
 
 def visit_timeout(scrolls: int) -> int:
@@ -510,6 +525,7 @@ class Collector:
         self.pending: set[asyncio.Task] = set()
         self.dump_n = 0
         self.failures = 0  # consecutive failed visits
+        self.post_responses = 0  # /graphql responses that carried posts (all visits)
         page.on("response", self._on_response)
 
     def _on_response(self, resp):
@@ -523,6 +539,8 @@ class Collector:
             body = await asyncio.wait_for(resp.text(), RESPONSE_TIMEOUT_S)
         except Exception:  # includes TimeoutError: a body that never finishes is dropped
             return
+        if '"taken_at"' in body:
+            self.post_responses += 1
         self._ingest(body, "gql")
 
     def _ingest(self, body: str, kind: str):
@@ -549,6 +567,7 @@ class Collector:
     async def visit(self, url: str, source: str, scrolls: int, stop_before: int | None = None):
         kind, _, target = source.partition(":")
         started, start_new, start_seen = now(), self.store.new_posts, self.store.seen_posts
+        start_resp = self.post_responses
         try:
             await asyncio.wait_for(self._visit(url, source, scrolls, stop_before),
                                    visit_timeout(scrolls))
@@ -561,7 +580,8 @@ class Collector:
             self.store.commit()
             self.store.log_visit(self.run_id, kind, target, started,
                                  self.store.new_posts - start_new,
-                                 self.store.seen_posts - start_seen, status)
+                                 self.store.seen_posts - start_seen, status,
+                                 self.post_responses - start_resp)
             print(f"[{source}] failed: {status} {e}")
             self.failures += 1
             if self.failures >= MAX_VISIT_FAILURES:
@@ -570,7 +590,9 @@ class Collector:
         self.failures = 0
         self.store.log_visit(self.run_id, kind, target, started,
                              self.store.new_posts - start_new,
-                             self.store.seen_posts - start_seen, "ok")
+                             self.store.seen_posts - start_seen, "ok",
+                             self.post_responses - start_resp)
+        return self.post_responses - start_resp
 
     async def _visit(self, url: str, source: str, scrolls: int, stop_before: int | None = None):
         self.source = source
@@ -779,10 +801,9 @@ async def snowball(col: Collector, topic: dict, a):
     # Post pages: on-topic posts with replies.
     # Live topics: posts from the last `revisit_days`, never-opened first, then the most
     # replied-to, re-opened every `revisit_hours` (builds the snapshot time series).
-    # Historical topics (`period`): posts inside the period whose replies are still
-    # incomplete - never opened, or fewer than REPLY_COMPLETE of the replies Threads shows
-    # collected so far - most missing replies first. Each page is opened at most
-    # MAX_HISTORY_OPENS times, since Threads may never show every reply (deleted/hidden).
+    # Historical topics (`period`): posts inside the period never opened yet (most
+    # replied-to first), then pages whose last visit loaded no reply batches (throttled;
+    # see INLINE_REPLIES), at most MAX_HISTORY_OPENS opens each.
     if topic["period_ts"]:
         since, until = topic["period_ts"]
         urls = [r[0] for r in st.db.execute(
@@ -793,12 +814,19 @@ async def snowball(col: Collector, topic: dict, a):
                SELECT p.url FROM posts p JOIN post_topics t ON t.post_pk = p.pk AND t.topic = ?
                LEFT JOIN got g ON g.url = p.url
                LEFT JOIN opens o ON o.target = p.url
+               LEFT JOIN (SELECT target, n_responses FROM visits v1
+                          WHERE kind = 'post' AND status = 'ok' AND started_at =
+                            (SELECT MAX(started_at) FROM visits v2 WHERE v2.kind = 'post'
+                             AND v2.status = 'ok' AND v2.target = v1.target)) lv
+                      ON lv.target = p.url
                WHERE t.on_topic = 1 AND p.found_as = 'result' AND p.is_reply = 0
                  AND p.url IS NOT NULL AND p.reply_count > 0 AND p.taken_at BETWEEN ? AND ?
-                 AND COALESCE(g.n, 0) < ? * p.reply_count
-                 AND COALESCE(o.n, 0) < ?
-               ORDER BY p.reply_count - COALESCE(g.n, 0) DESC LIMIT ?""",
-            (name, since, until, REPLY_COMPLETE, MAX_HISTORY_OPENS, a.max_post_pages))]
+                 AND (o.n IS NULL                                   -- never opened
+                      OR (lv.n_responses = 0 AND p.reply_count > ?  -- last visit throttled
+                          AND COALESCE(g.n, 0) < ? * p.reply_count AND o.n < ?))
+               ORDER BY o.n IS NOT NULL, p.reply_count DESC LIMIT ?""",
+            (name, since, until, INLINE_REPLIES, REPLY_COMPLETE, MAX_HISTORY_OPENS,
+             a.max_post_pages))]
         post_scrolls = a.post_scrolls or HISTORY_POST_SCROLLS
     else:
         since, until = now() - a.revisit_days * 86400, now()
@@ -815,9 +843,24 @@ async def snowball(col: Collector, topic: dict, a):
             (name, since, until, fresh, a.max_post_pages))]
         post_scrolls = a.post_scrolls or LIVE_POST_SCROLLS
     print(f"post pages: {len(urls)} ({post_scrolls} scrolls each)")
+    replies_of = dict(st.db.execute(
+        f"SELECT url, reply_count FROM posts WHERE found_as = 'result' AND url IN "
+        f"({','.join('?' * len(urls))})", urls).fetchall()) if urls else {}
+    streak, backed_off = 0, False
     for url in urls:
-        await col.visit(url, f"post:{url}", post_scrolls)
+        n_resp = await col.visit(url, f"post:{url}", post_scrolls)
         await polite_pause()
+        if (replies_of.get(url) or 0) > INLINE_REPLIES:
+            streak = streak + 1 if n_resp == 0 else 0
+        if streak >= THROTTLE_STREAK:
+            if backed_off:
+                print(f"reply loading still throttled after a pause - skipping the remaining "
+                      f"post pages this round")
+                break
+            print(f"{streak} reply pages in a row loaded no reply batches - "
+                  f"pausing {THROTTLE_PAUSE_S // 60} min")
+            await asyncio.sleep(THROTTLE_PAUSE_S)
+            streak, backed_off = 0, True
     print(f"tagged {st.tag_topic(topic)} on-topic posts")
 
     # Profiles of people taking part in on-topic conversations (repliers on on-topic post
