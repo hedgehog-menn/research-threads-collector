@@ -221,6 +221,18 @@ Meta's definition of coordinated *inauthentic* behavior depends on deception, me
 - **Bridge** (coordination and inauthenticity at once): `text_clusters.min_signup_gap` and `user_features.min_signup_gap_to_partner`, the smallest difference in Threads signup number between accounts that copied the same text. Accounts created in a batch get adjacent numbers. Only defined where numbers exist (the first 100M accounts, mostly the July 2023 wave), so later sockpuppets (`100M+`) can't be checked this way.
 - **Descriptive** (context, not evidence): `lang`, `top_lang`, `tz_offset`, `n_posts`
 
+## Exports and report
+
+Run these after `tag` and `features.py --topic …`. Both write to `export/`, which is not in git because it holds collected user data.
+
+```zsh
+python scripts/export_csv.py      # export/csv/: posts_on_topic.csv, accounts.csv, text_clusters.csv, hashtags.csv, hashtag_pairs.csv
+python scripts/make_report.py     # export/report/: threads_dataset_report.docx + 7 figures
+python scripts/make_demo.py       # export/demo/: smaller demo package
+```
+
+`posts_on_topic.csv` has one row per on-topic post in the study period, with author, language, copy-cluster and hashtag columns. `accounts.csv` has one row per account that wrote one of those posts, with every account-level feature. The two join on `user_id`. The report's section 5 is the column guide, and every number in the report is queried from the database when it's built.
+
 ## Troubleshooting
 
 - **`redirected to login wall`**: the session expired. Run `login` again.

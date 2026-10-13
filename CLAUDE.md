@@ -75,5 +75,7 @@ Use these; older figures elsewhere in chat history are superseded.
 ## Demo
 `scripts/make_demo.py` builds `export/demo/` (not in git): a posts-per-month chart cropped to the study period, sample posts per conflict phase, and top accounts with a repost-to-like ratio. Columns that are still empty are dropped. Re-run `tag` first if the keywords changed.
 
+`scripts/export_csv.py` writes analysis-ready CSVs to `export/csv/` (posts_on_topic, accounts, text_clusters, hashtags, hashtag_pairs). `scripts/make_report.py` builds `export/report/threads_dataset_report.docx`, with 7 figures, findings, limitations and the CSV column guide, all queried from the DB. It uses python-docx because Node isn't installed. Thai and Khmer hashtags appear in charts by their English meaning (`GLOSS`, taken from the trilingual template post), because matplotlib can't shape Khmer; the report table shows the originals.
+
 ## Downstream
 The output feeds KT's existing detection and drift-monitoring pipeline: five classifiers (NB, RF, SVM, DNN, DT), with PSI/KS input drift, prediction drift, and the degradation risk score. Keep the output tabular and reproducible. Every row should be traceable to when and how it was scraped.
