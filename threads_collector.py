@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS posts (
 );
 CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_pk);
 CREATE INDEX IF NOT EXISTS idx_posts_root ON posts(thread_root_pk);
+CREATE INDEX IF NOT EXISTS idx_posts_url ON posts(url);
+CREATE INDEX IF NOT EXISTS idx_posts_source ON posts(source);  -- replies link to their page
 
 CREATE TABLE IF NOT EXISTS post_snapshots (
     post_pk TEXT,
