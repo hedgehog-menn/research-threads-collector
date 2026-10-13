@@ -771,14 +771,16 @@ async def snowball(col: Collector, topic: dict, a):
     Re-running it (e.g. from cron) revisits recent on-topic posts, which builds the
     post_snapshots time series."""
     st, name = col.store, topic["name"]
-    print(f"== run {col.run_id}  topic={name}")
+    print(f"== run {col.run_id}  topic={name}" + ("  (post pages only)" if a.only_posts else ""))
+    if a.only_posts:  # reply pages only: no searches, seeds, profiles or location lookups
+        a.max_profiles = a.max_locations = 0
 
-    for kw in topic["search"]:
+    for kw in ([] if a.only_posts else topic["search"]):
         for mode in topic["search_modes"]:  # "recent" = newest first, "top" = Threads' ranking
             kind = "search" if mode == "recent" else "search_top"
             await col.visit(search_url(kw, recent=mode == "recent"), f"{kind}:{kw}", a.search_scrolls)
             await polite_pause()
-    for u in topic["seeds"]:
+    for u in ([] if a.only_posts else topic["seeds"]):
         if topic["period_ts"]:
             # Scroll back to the period start until some visit has actually reached it;
             # after that, only back to the last visit (a shallow earlier visit - e.g. a
@@ -932,6 +934,8 @@ def build_args():
     p.add_argument("--post-scrolls", type=int, default=None,
                    help="scrolls per post page (default: 10 live, 40 for historical topics)")
     p.add_argument("--max-post-pages", type=int, default=30)
+    p.add_argument("--only-posts", action="store_true",
+                   help="only open reply pages (skip searches, seeds, profiles, location lookups)")
     p.add_argument("--max-profiles", type=int, default=30)
     p.add_argument("--max-locations", type=int, default=50)
     p.add_argument("--revisit-days", type=int, default=14, help="re-open post pages of on-topic posts up to this old")
