@@ -9,6 +9,7 @@ Run `tag` and `features.py --topic ...` first so on-topic flags and copy cluster
 current. Prints plain-text sections; nothing is written.
 """
 import argparse
+import datetime as _dt
 import json
 import sqlite3
 import sys
@@ -70,7 +71,9 @@ def main():
     for label, s, e in phases:
         n, au, rep = q(f"""SELECT COUNT(*), COUNT(DISTINCT p.username), SUM(p.is_reply) FROM posts p {ON}
                            WHERE p.taken_at >= strftime('%s', ?) AND p.taken_at < strftime('%s', ?)""", s, e)[0]
-        print(f"  {label:<24} posts {n:>5}  authors {au:>5}  replies {rep or 0:>5}")
+        days =(_dt.date.fromisoformat(e) - _dt.date.fromisoformat(s)).days
+        print(f"  {label:<24} {days:>3} days  posts {n:>5} ({n / days:6.1f}/day)  "
+              f"authors {au:>5}  replies {rep or 0:>5}")
 
     print("\n## 3. Search terms and on-topic rule")
     print(f"search mode(s): {topic.get('search_modes', ['recent'])}")
@@ -155,6 +158,19 @@ def main():
               f"under 60 s: {sum(g < 60 for g in gaps)}, under 1 h: {sum(g < 3600 for g in gaps)}")
         sg = [c[5] for c in multi if c[5] is not None]
         print(f"clusters with a signup-number gap: {len(sg)}" + (f" (smallest {min(sg)})" if sg else ""))
+
+    print("\n## 8. Hashtags (coordination: shared campaign tags and rare-tag pairs)")
+    if not has("hashtags"):
+        print("not built (run features.py)")
+        return
+    print(f"hashtags: {one('SELECT COUNT(*) FROM hashtags')}; campaign tags (20+ accounts): "
+          f"{one('SELECT COUNT(*) FROM hashtags WHERE is_campaign = 1')}; "
+          f"account pairs sharing rare tags (2-10 accounts): {one('SELECT COUNT(*) FROM hashtag_pairs')}")
+    print("top hashtags by distinct accounts (all collected posts):")
+    for n, posts, tag in q("SELECT n_accounts, n_posts, tag FROM hashtags ORDER BY n_accounts DESC LIMIT 8"):
+        print(f"  {n:>4} accounts  {posts:>4} posts  {tag}")
+
+
 
 
 if __name__ == "__main__":

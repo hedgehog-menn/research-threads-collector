@@ -48,7 +48,8 @@
     "Banteay Meanchey",
     "Chong Bok",
     "Emerald Triangle",
-    "Kuala Lumpur Peace Accord"
+    "Kuala Lumpur Peace Accord",
+    "Kuala Lumpur Peace Accords"
   ],
   "require_any": [
     [
@@ -72,7 +73,8 @@
       "Ta Kwai",
       "Chong Bok",
       "Emerald Triangle",
-      "Kuala Lumpur Peace Accord"
+      "Kuala Lumpur Peace Accord",
+      "Kuala Lumpur Peace Accords"
     ],
     [
       "border",
@@ -101,6 +103,7 @@
       "cease-fire",
       "truce",
       "peace accord",
+      "peace accords",
       "negotiation",
       "negotiations",
       "shelling",

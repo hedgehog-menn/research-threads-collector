@@ -202,11 +202,21 @@ FROM text_clusters WHERE n_accounts >= 2 ORDER BY n_accounts DESC, span_hours;
 
 A cluster only shows that the same text appeared; it doesn't show coordination by itself. Outlets reposting wire copy, or users sharing the same article title, cluster too.
 
+### Hashtag co-usage
+
+Copy-paste clusters remove hashtags before comparing text, so they miss accounts that push the same campaign hashtags in different wording or languages. `features.py` covers that separately. Hashtags are normalized first: casefolded, with trailing punctuation and emoji removed, keeping Thai and Khmer combining marks.
+
+- **`hashtags`**: `tag`, `n_accounts`, `n_posts`, `first_at`, `last_at`, `is_campaign` (1 if 20 or more accounts use it)
+- **`hashtag_pairs`**: `user_a`, `user_b`, `n_shared`, `shared_tags`, for account pairs that share **rare** hashtags (used by 2–10 accounts). Sharing a tag that few accounts use is unlikely to be chance.
+- In `user_features`: `n_hashtags`, `n_campaign_tags` and `n_rare_tag_partners`
+
+Benign pairs exist too: news outlets share topical tags such as #iran or #us. Like the copy clusters, this is coordination evidence, not proof of fake accounts.
+
 ### Feature groups: coordination vs inauthenticity
 
 Meta's definition of coordinated *inauthentic* behavior depends on deception, meaning fake or misrepresented accounts. Real users in a national conflict often copy and paste a shared message on purpose ("share this"), so keep the two kinds of evidence as separate feature groups:
 
-- **Coordination** (what accounts do together): `text_clusters`, `n_copy_posts`, `n_copy_partners`, `fastest_copy_gap_s`, and later co-reply patterns
+- **Coordination** (what accounts do together): `text_clusters`, `n_copy_posts`, `n_copy_partners`, `fastest_copy_gap_s`, `hashtags` / `hashtag_pairs`, `n_campaign_tags`, `n_rare_tag_partners`, and later co-reply patterns
 - **Inauthenticity** (what an account is): `joined_month` and `account_age_months` (parsed from the "About this profile" text in `country_raw`, so only for location-checked users). This is the **Threads** join date, not Instagram's: it comes with a Threads signup number (zuck #1, mosseri #2), and nothing predates April 2023. About half of accounts show July 2023, the launch wave, so raw age is compressed. `signup_number` orders accounts within that wave, but only the first 100M accounts get one; `signup_over_100m` = 1 for later accounts. With `--topic`, `months_join_to_next_peak` (0 = joined in a fighting month) and `joined_in_period` relate the join date to the conflict. Everything is month precision only; `tz_margin` and `tz_quiet_share` (no rhythm or the wrong rhythm), `flag_tz_vs_country`, `flag_bio_vs_country`, and a "Based in" country that doesn't fit the activity
 - **Bridge** (coordination and inauthenticity at once): `text_clusters.min_signup_gap` and `user_features.min_signup_gap_to_partner`, the smallest difference in Threads signup number between accounts that copied the same text. Accounts created in a batch get adjacent numbers. Only defined where numbers exist (the first 100M accounts, mostly the July 2023 wave), so later sockpuppets (`100M+`) can't be checked this way.
 - **Descriptive** (context, not evidence): `lang`, `top_lang`, `tz_offset`, `n_posts`

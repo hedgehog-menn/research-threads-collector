@@ -11,6 +11,8 @@ and flags where they disagree. The flags are candidate CIB features, not labels.
   text_clusters       groups of posts with the same or nearly the same text (copy-paste),
                       with how many accounts posted them and over what time span
   post_text_clusters  which cluster each duplicated post belongs to
+  hashtags            each hashtag: how many accounts/posts use it, first/last use
+  hashtag_pairs       account pairs sharing RARE hashtags (used by 2-10 accounts)
 
 Usage:
   python features.py                    # reads/writes threads.db
@@ -34,7 +36,7 @@ from pathlib import Path
 import hanzidentifier as hz
 from lingua import LanguageDetectorBuilder
 
-FEATURES_VERSION = "5"
+FEATURES_VERSION = "6"
 
 MIN_LATIN_LETTERS = 12  # below this, Latin-script language detection is guesswork
 MIN_TZ_POSTS = 20       # posts needed to fit an active-hours offset
@@ -341,6 +343,70 @@ def text_clusters(posts):
     return clusters
 
 
+# ---------------------------------------------------------------- hashtag co-usage
+
+# Copy-paste clusters strip hashtags before comparing text, so posts that share campaign
+# hashtags in different wording (or languages) are invisible to them. These features
+# cover that: shared campaign hashtags, and pairs of accounts sharing RARE hashtags.
+HASHTAG_RE2 = re.compile(r"#[^\s#]+")
+TAG_TRAIL = ".,!?;:\u3002\u17d4\u17d5\u0e2f\"'\u201d\u2019)]}"  # incl. CJK/Khmer/Thai stops
+CAMPAIGN_MIN_ACCOUNTS = 20   # a hashtag this many accounts use is a campaign tag
+RARE_MAX_ACCOUNTS = 10       # sharing a tag this few accounts use is a co-usage signal
+
+
+def hashtags_of(text: str):
+    """Normalized hashtags in a post: casefolded, trailing punctuation removed."""
+    tags = set()
+    for raw in HASHTAG_RE2.findall(text or ""):
+        tag = raw.rstrip(TAG_TRAIL)
+        # drop trailing emoji/symbols/punctuation (incl. flags, variation selectors, ZWJ),
+        # but keep combining marks (Mn/Mc): Thai and Khmer words end in them
+        while len(tag) > 1 and (unicodedata.category(tag[-1])[0] in "SP"
+                                or unicodedata.category(tag[-1]) == "Cf" or tag[-1] == "\ufe0f"):
+            tag = tag[:-1]
+        tag = tag.casefold()
+        if len(tag) > 1:
+            tags.add(tag)
+    return tags
+
+
+def hashtag_features(posts):
+    """posts: [(username, text, taken_at)] -> (tag rows, pair rows, per-user dict)."""
+    users_of, posts_of, times_of = {}, Counter(), {}
+    tags_by_user: dict[str, set] = {}
+    for u, text, ts in posts:
+        for tag in hashtags_of(text):
+            users_of.setdefault(tag, set()).add(u)
+            posts_of[tag] += 1
+            if ts:
+                times_of.setdefault(tag, []).append(ts)
+            tags_by_user.setdefault(u, set()).add(tag)
+    tag_rows = [{"tag": tag, "n_accounts": len(us), "n_posts": posts_of[tag],
+                 "first_at": min(times_of[tag]) if tag in times_of else None,
+                 "last_at": max(times_of[tag]) if tag in times_of else None,
+                 "is_campaign": int(len(us) >= CAMPAIGN_MIN_ACCOUNTS)}
+                for tag, us in users_of.items()]
+    shared: dict[tuple, set] = {}
+    for tag, us in users_of.items():
+        if 2 <= len(us) <= RARE_MAX_ACCOUNTS:
+            us = sorted(us)
+            for i in range(len(us)):
+                for j in range(i + 1, len(us)):
+                    shared.setdefault((us[i], us[j]), set()).add(tag)
+    pair_rows = [{"user_a": a, "user_b": b, "n_shared": len(t),
+                  "shared_tags": json.dumps(sorted(t), ensure_ascii=False)}
+                 for (a, b), t in shared.items()]
+    partners: dict[str, set] = {}
+    for a, b in shared:
+        partners.setdefault(a, set()).add(b)
+        partners.setdefault(b, set()).add(a)
+    per_user = {u: {"n_hashtags": len(tags),
+                    "n_campaign_tags": sum(len(users_of[t]) >= CAMPAIGN_MIN_ACCOUNTS for t in tags),
+                    "n_rare_tag_partners": len(partners.get(u, ()))}
+                for u, tags in tags_by_user.items()}
+    return tag_rows, pair_rows, per_user
+
+
 # ---------------------------------------------------------------- tables
 
 POST_COLS = ["post_pk", "user_pk", "lang", "lang_conf", "script", "n_han", "n_trad_only",
@@ -350,10 +416,12 @@ USER_COLS = ["user_pk", "username", "country", "n_posts", "top_lang", "top_lang_
              "tz_quiet_share", "tz_n_posts", "bio_country", "bio_term",
              "flag_bio_vs_country", "flag_tz_vs_country", "flag_simplified_in_taiwan",
              "n_copy_posts", "n_copy_partners", "fastest_copy_gap_s", "min_signup_gap_to_partner",
+             "n_hashtags", "n_campaign_tags", "n_rare_tag_partners",
              "joined_month", "account_age_months", "signup_number", "signup_over_100m",
              "months_join_to_next_peak", "joined_in_period", "features_version", "computed_at"]
 # Feature groups (keep them apart when modelling - see README):
-#   coordination:    n_copy_posts, n_copy_partners, fastest_copy_gap_s (+ text_clusters)
+#   coordination:    n_copy_posts, n_copy_partners, fastest_copy_gap_s (+ text_clusters),
+#                    n_campaign_tags, n_rare_tag_partners (+ hashtags, hashtag_pairs)
 #   bridge (both):   min_signup_gap_to_partner / text_clusters.min_signup_gap - copy
 #                    partners whose accounts were created back-to-back
 #   inauthenticity:  flag_*, tz_margin / tz_quiet_share, bio_country vs country,
@@ -365,6 +433,9 @@ CLUSTER_COLS = ["cluster_id", "n_posts", "n_accounts", "usernames", "exact", "fi
                 "n_with_signup", "first_post_pk", "sample_text",
                 "features_version", "computed_at"]
 POST_CLUSTER_COLS = ["post_pk", "cluster_id"]
+HASHTAG_COLS = ["tag", "n_accounts", "n_posts", "first_at", "last_at", "is_campaign",
+                "features_version", "computed_at"]
+HASHTAG_PAIR_COLS = ["user_a", "user_b", "n_shared", "shared_tags", "features_version", "computed_at"]
 
 
 def build(db: sqlite3.Connection, topic: dict | None = None):
@@ -416,6 +487,10 @@ def build(db: sqlite3.Connection, topic: dict | None = None):
             copy_posts[user_of[pk]] += 1
 
     user_rows = []
+    tag_rows, pair_rows, tag_user = hashtag_features([(u, t, ts) for _, _, t, ts, u in posts])
+    for r in tag_rows + pair_rows:
+        r.update(features_version=FEATURES_VERSION, computed_at=t0)
+
     for upk, username, country, bio, country_raw in db.execute(
         "SELECT pk, username, country, bio, country_raw FROM users"
     ):
@@ -449,6 +524,9 @@ def build(db: sqlite3.Connection, topic: dict | None = None):
             "n_copy_partners": len(partners.get(username, ())),
             "fastest_copy_gap_s": fastest.get(username),
             "min_signup_gap_to_partner": signup_gap.get(username),
+            "n_hashtags": tag_user.get(username, {}).get("n_hashtags", 0),
+            "n_campaign_tags": tag_user.get(username, {}).get("n_campaign_tags", 0),
+            "n_rare_tag_partners": tag_user.get(username, {}).get("n_rare_tag_partners", 0),
             "joined_month": (jm := joined_month(country_raw)),
             "signup_number": signup_number(country_raw)[0],
             "signup_over_100m": signup_number(country_raw)[1],
@@ -461,12 +539,12 @@ def build(db: sqlite3.Connection, topic: dict | None = None):
         })
     post_clusters = [{"post_pk": pk, "cluster_id": c["cluster_id"]}
                      for c in clusters for pk in c["post_pks"]]
-    return post_rows, user_rows, clusters, post_clusters
+    return post_rows, user_rows, clusters, post_clusters, tag_rows, pair_rows
 
 
-def write_table(db, name, cols, rows):
+def write_table(db, name, cols, rows, key=None):
     db.execute(f"DROP TABLE IF EXISTS {name}")
-    db.execute(f"CREATE TABLE {name} ({', '.join(cols)}, PRIMARY KEY ({cols[0]}))")
+    db.execute(f"CREATE TABLE {name} ({', '.join(cols)}, PRIMARY KEY ({key or cols[0]}))")
     db.executemany(
         f"INSERT INTO {name} VALUES ({','.join('?' * len(cols))})",
         [tuple(r[c] for c in cols) for r in rows],
@@ -483,11 +561,13 @@ def main():
 
     db = sqlite3.connect(a.db)
     topic = json.loads(a.topic.read_text(encoding="utf-8")) if a.topic else None
-    post_rows, user_rows, clusters, post_clusters = build(db, topic)
+    post_rows, user_rows, clusters, post_clusters, tag_rows, pair_rows = build(db, topic)
     write_table(db, "post_features", POST_COLS, post_rows)
     write_table(db, "user_features", USER_COLS, user_rows)
     write_table(db, "text_clusters", CLUSTER_COLS, clusters)
     write_table(db, "post_text_clusters", POST_CLUSTER_COLS, post_clusters)
+    write_table(db, "hashtags", HASHTAG_COLS, tag_rows)
+    write_table(db, "hashtag_pairs", HASHTAG_PAIR_COLS, pair_rows, key="user_a, user_b")
     db.commit()
 
     if a.csv:
@@ -495,7 +575,9 @@ def main():
         for name, cols, rows in [("post_features", POST_COLS, post_rows),
                                  ("user_features", USER_COLS, user_rows),
                                  ("text_clusters", CLUSTER_COLS, clusters),
-                                 ("post_text_clusters", POST_CLUSTER_COLS, post_clusters)]:
+                                 ("post_text_clusters", POST_CLUSTER_COLS, post_clusters),
+                                 ("hashtags", HASHTAG_COLS, tag_rows),
+                                 ("hashtag_pairs", HASHTAG_PAIR_COLS, pair_rows)]:
             with open(a.csv / f"{name}.csv", "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
                 w.writeheader()
@@ -512,6 +594,8 @@ def main():
         print(f"  {flag}: {sum(vals)} of {len(vals)} checkable")
     multi = [c for c in clusters if c["n_accounts"] >= 2]
     print(f"  users with join date: {sum(u['joined_month'] is not None for u in user_rows)}")
+    print(f"  hashtags: {len(tag_rows)} ({sum(r['is_campaign'] for r in tag_rows)} campaign tags used "
+          f"by {CAMPAIGN_MIN_ACCOUNTS}+ accounts); account pairs sharing rare tags: {len(pair_rows)}")
     print(f"  copy-paste clusters: {len(clusters)} ({len(multi)} spanning 2+ accounts, "
           f"{sum(c['n_posts'] for c in multi)} posts, "
           f"{sum(u['n_copy_posts'] > 0 for u in user_rows)} accounts involved)")

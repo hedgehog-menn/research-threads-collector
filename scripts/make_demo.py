@@ -36,8 +36,8 @@ FIGHTING = {"2025-07": "July fighting", "2025-12": "December fighting"}
 MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 # chart tokens (light surface)
-SURF, INK, INK2, GRID, AXIS, BAND, SERIES = (
-    "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df", "#c9c8c3", "#efeeea", "#2a78d6")
+SURF, INK, INK2, GRID, AXIS, BAND, SERIES, SERIES_2 = (
+    "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df", "#c9c8c3", "#efeeea", "#2a78d6", "#eb6834")
 
 
 def months_between(start: str, end: str):
@@ -83,10 +83,17 @@ def main():
     months = months_between(per["from"], per["to"])
     counts = dict(db.execute(f"SELECT strftime('%Y-%m', p.taken_at, 'unixepoch'), COUNT(*) {on} GROUP BY 1"))
     vals = [counts.get(m, 0) for m in months]
+    # split: original posts (+ keyword-matching replies) vs replies counted via reply_scope
+    has_match = any(c[1] == "match" for c in db.execute("PRAGMA table_info(post_topics)"))
+    thread = dict(db.execute(
+        f"SELECT strftime('%Y-%m', p.taken_at, 'unixepoch'), COUNT(*) {on} AND t.match = 'thread' GROUP BY 1"
+    )) if has_match else {}
+    thread_vals = [thread.get(m, 0) for m in months]
+    orig_vals = [v - r for v, r in zip(vals, thread_vals)]
     with open(a.out / "monthly_on_topic_posts.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["month", "on_topic_posts"])
-        w.writerows(zip(months, vals))
+        w.writerow(["month", "on_topic_posts", "by_keywords", "thread_replies"])
+        w.writerows(zip(months, vals, orig_vals, thread_vals))
 
     # 2. sample posts: top 8 by likes per phase
     phase = "CASE " + " ".join(
@@ -113,7 +120,7 @@ def main():
       {on} GROUP BY p.username ORDER BY on_topic_posts DESC, total_likes DESC LIMIT 20""")
 
     # 4. chart
-    fig, ax = plt.subplots(figsize=(9, 4.2), dpi=200)
+    fig, ax = plt.subplots(figsize=(9.5, 4.8), dpi=200)
     fig.patch.set_facecolor(SURF)
     ax.set_facecolor(SURF)
     x = range(len(months))
@@ -121,11 +128,15 @@ def main():
         if m in months:
             i = months.index(m)
             ax.axvspan(i - 0.5, i + 0.5, color=BAND, zorder=0, lw=0)
-    ax.bar(x, vals, width=0.62, color=SERIES, zorder=2)
+    # stacked: keyword-matched (mostly English originals) at the base, thread replies on
+    # top, with a 2 px surface gap between the segments
+    ax.bar(x, orig_vals, width=0.62, color=SERIES, zorder=2, label="Matched by keywords (English originals + keyword-matching replies)")
+    ax.bar(x, thread_vals, width=0.62, bottom=orig_vals, color=SERIES_2, zorder=2,
+           edgecolor=SURF, linewidth=2, label="Replies under those posts (any language)")
     for m, label in FIGHTING.items():
         if m in months:
             i = months.index(m)
-            ax.annotate(f"{vals[i]}", (i, vals[i]), xytext=(0, 4), textcoords="offset points",
+            ax.annotate(f"{vals[i]:,}", (i, vals[i]), xytext=(0, 4), textcoords="offset points",
                         ha="center", va="bottom", fontsize=10, color=INK, fontweight="bold")
             ax.annotate(label, (i, vals[i]), xytext=(0, 20), textcoords="offset points",
                         ha="center", va="bottom", fontsize=9, color=INK2)
@@ -142,11 +153,15 @@ def main():
     ax.spines["bottom"].set_visible(True)
     ax.spines["bottom"].set_color(AXIS)
     total = sum(vals)
-    ax.set_title("English Threads posts about the Thailand–Cambodia border conflict",
+    ax.set_title("On-topic posts: English originals + their replies (any language)",
                  loc="left", fontsize=12, color=INK, pad=22)
-    ax.text(0, 1.035, f"On-topic posts per month in the study period "
-            f"({per['from']} to {per['to']}), n = {total}, by posting date (UTC)",
+    ax.text(0, 1.035, f"Thailand–Cambodia border conflict on Threads · per month, "
+            f"{per['from']} to {per['to']} · n = {total:,} · posting date (UTC)",
             transform=ax.transAxes, fontsize=9, color=INK2)
+    leg = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=2, frameon=False,
+                    fontsize=8.5, handlelength=1.2)
+    for t in leg.get_texts():
+        t.set_color(INK2)
     fig.tight_layout()
     fig.savefig(a.out / "posts_per_month.png", facecolor=SURF)
 

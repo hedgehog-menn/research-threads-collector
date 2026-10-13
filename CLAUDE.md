@@ -62,6 +62,16 @@ Resolved 2026-10-10: a round froze for 32 h (no sleep, network fine) waiting on 
 
 Resolved: the location lookup clicked the sidebar's "More" button instead of the profile's; that's fixed. The old test data was moved to `threads_test.db`; the demo collects into a fresh `threads.db`.
 
+## Verified numbers (2026-10-13, after all reply pages were opened)
+Use these; older figures elsewhere in chat history are superseded.
+- Study period on-topic: **9,211 posts from 3,905 accounts** = **2,952 keyword-matched + 6,259 thread replies** (after adding the plural "Peace Accords" terms; before that 9,208 = 2,949 + 6,259). 6,281 is the *all-dates* thread-reply count, not the study-period one.
+- Phases (`report_stats.py` prints per-day rates, since phases differ in length): before 173 | July 3,868 | between 2,413 (4 months) | December 2,516 | after 238.
+- Throughput: about **6,000 posts per page-hour** excluding the 52.9 h visit during which the laptop slept. Do not quote the raw ~795 per page-hour or the 323 h "wall clock": they include sleep, a 32 h freeze, and two weeks between rounds. 1,218 logged page loads, all ok; the frozen round's unfinished visit was never logged.
+- Location: 250 checked (6.4% of on-topic authors), 96% with a country. Cluster members (n=50): Cambodia 45 / Thailand 4; random authors (n=50): Thailand 19 / Cambodia 19 / other 11. Fisher exact (Cambodia vs Thailand): **OR = 11.25, p = 1.6e-5**. Caveats: the cluster group is partly circular (clusters found in Cambodian-side text), n is about 50, and English originals only.
+- Account age (250 lookups): July-2023 launch wave **26%** (65/250; the old 54% came from test data), joined inside the study period 26% (66/250), signup "100M+" 76% (189/250).
+- Hashtags (distinct accounts, all collected posts, after normalization): #justiceforcambodia 333, #thailandstartedthewar 302, #cambodianeedpeace 299, the Thai version #ไทยเป็นผู้เริ่มสงคราม 229, the Khmer version #ថៃជាអ្នកផ្តើមសង្គ្រាម 223. Sentence-hashtags in Khmer, Chinese and English are used by about 96–101 accounts each. The strongest **rare-tag** pair is Thai-side (lalabell_tw + panny_nutsinee, 18 shared tags incl. #hunsenwarcriminal, #royalthaiairforce), so hashtags reveal Thai-side coordination that copy clusters did not.
+- "ASEAN" in the conflict-term list was reviewed: 15 posts rely on it alone, 12 relevant and 3 not (an election thank-you, an English-dialect list, an ASEAN flood post). Kept.
+
 ## Demo
 `scripts/make_demo.py` builds `export/demo/` (not in git): a posts-per-month chart cropped to the study period, sample posts per conflict phase, and top accounts with a repost-to-like ratio. Columns that are still empty are dropped. Re-run `tag` first if the keywords changed.
 
