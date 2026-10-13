@@ -64,7 +64,7 @@ A topic file (`topics/*.json`) has these fields:
 - `seeds`: Threads handles without `@`
 - `search_modes` (optional): `["recent"]` (the default, newest first) and/or `["top"]` (Threads' own ranking, which surfaces older posts)
 - `peaks` (optional): months of peak events, such as `["2025-07", "2025-12"]`, used by `features.py --topic`
-- `period` (optional): `{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}` makes this a **historical** topic. Seed profiles are scrolled back until they reach `from`, up to `--seed-scrolls`, default 400. Later rounds only scroll back to the previous visit. Post pages are opened for on-topic posts inside the period, once each, instead of the rolling 14-day window.
+- `period` (optional): `{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}` makes this a **historical** topic. Seed profiles are scrolled back until they reach `from`, up to `--seed-scrolls`, default 400. Later rounds only scroll back to the previous visit. Post pages are opened for on-topic English original posts inside the period whose replies are still incomplete: never opened, or under 80% of the replies Threads shows collected so far. The most missing replies go first, each page is opened at most 3 times, and historical pages get 40 scrolls (live topics get 10). Override with `--post-scrolls`.
 - `exclude_users` (optional): accounts whose posts are kept but never opened as profiles or location-checked, such as `meta.ai`, Meta's AI bot that replies to users
 
 Topics:

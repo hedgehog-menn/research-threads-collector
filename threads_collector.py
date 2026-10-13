@@ -490,6 +490,13 @@ LOCATION_TIMEOUT_S = 120  # one whole "About this profile" lookup
 MAX_VISIT_FAILURES = 3    # consecutive failed/timed-out visits before the run stops
 
 
+# Reply pages
+LIVE_POST_SCROLLS = 10      # live topics re-open pages often, so a shallow pass is enough
+HISTORY_POST_SCROLLS = 40   # historical pages are opened rarely: go deep (10 got ~39%)
+REPLY_COMPLETE = 0.8        # historical page counts as done at this share of reply_count
+MAX_HISTORY_OPENS = 3       # give up on a page after this many opens
+
+
 def visit_timeout(scrolls: int) -> int:
     """Upper bound for one page visit: load + per-scroll wait (max 3.5 s) + drain, x2 slack."""
     return 120 + scrolls * 2 * (4 + DRAIN_TIMEOUT_S // 6)
@@ -769,28 +776,47 @@ async def snowball(col: Collector, topic: dict, a):
         await polite_pause()
     print(f"tagged {st.tag_topic(topic)} on-topic posts")
 
-    # Post pages: on-topic posts with replies, never-opened first, then the most replied-to.
-    # Live topics: posts from the last `revisit_days`, re-opened every `revisit_hours`
-    # (builds the snapshot time series). Historical topics (`period`): posts inside the
-    # period, each opened once - their conversations are over.
+    # Post pages: on-topic posts with replies.
+    # Live topics: posts from the last `revisit_days`, never-opened first, then the most
+    # replied-to, re-opened every `revisit_hours` (builds the snapshot time series).
+    # Historical topics (`period`): posts inside the period whose replies are still
+    # incomplete - never opened, or fewer than REPLY_COMPLETE of the replies Threads shows
+    # collected so far - most missing replies first. Each page is opened at most
+    # MAX_HISTORY_OPENS times, since Threads may never show every reply (deleted/hidden).
     if topic["period_ts"]:
         since, until = topic["period_ts"]
-        fresh = 0  # v.last < 0 never holds: only never-opened posts
+        urls = [r[0] for r in st.db.execute(
+            """WITH got AS (SELECT substr(source, 6) AS url, COUNT(*) AS n FROM posts
+                            WHERE found_as = 'reply' AND source LIKE 'post:%' GROUP BY 1),
+                    opens AS (SELECT target, COUNT(*) AS n FROM visits
+                              WHERE kind = 'post' AND status = 'ok' GROUP BY target)
+               SELECT p.url FROM posts p JOIN post_topics t ON t.post_pk = p.pk AND t.topic = ?
+               LEFT JOIN got g ON g.url = p.url
+               LEFT JOIN opens o ON o.target = p.url
+               WHERE t.on_topic = 1 AND p.found_as = 'result' AND p.is_reply = 0
+                 AND p.url IS NOT NULL AND p.reply_count > 0 AND p.taken_at BETWEEN ? AND ?
+                 AND COALESCE(g.n, 0) < ? * p.reply_count
+                 AND COALESCE(o.n, 0) < ?
+               ORDER BY p.reply_count - COALESCE(g.n, 0) DESC LIMIT ?""",
+            (name, since, until, REPLY_COMPLETE, MAX_HISTORY_OPENS, a.max_post_pages))]
+        post_scrolls = a.post_scrolls or HISTORY_POST_SCROLLS
     else:
         since, until = now() - a.revisit_days * 86400, now()
         fresh = now() - a.revisit_hours * 3600
-    urls = [r[0] for r in st.db.execute(
-        """SELECT p.url FROM posts p JOIN post_topics t ON t.post_pk = p.pk AND t.topic = ?
-           LEFT JOIN (SELECT target, MAX(started_at) last FROM visits
-                      WHERE kind = 'post' AND status = 'ok' GROUP BY target) v
-                  ON v.target = p.url
-           WHERE t.on_topic = 1 AND p.found_as = 'result' AND p.url IS NOT NULL
-             AND p.reply_count > 0 AND p.taken_at BETWEEN ? AND ?
-             AND (v.last IS NULL OR v.last < ?)
-           ORDER BY v.last IS NOT NULL, p.reply_count DESC LIMIT ?""",
-        (name, since, until, fresh, a.max_post_pages))]
+        urls = [r[0] for r in st.db.execute(
+            """SELECT p.url FROM posts p JOIN post_topics t ON t.post_pk = p.pk AND t.topic = ?
+               LEFT JOIN (SELECT target, MAX(started_at) last FROM visits
+                          WHERE kind = 'post' AND status = 'ok' GROUP BY target) v
+                      ON v.target = p.url
+               WHERE t.on_topic = 1 AND p.found_as = 'result' AND p.url IS NOT NULL
+                 AND p.reply_count > 0 AND p.taken_at BETWEEN ? AND ?
+                 AND (v.last IS NULL OR v.last < ?)
+               ORDER BY v.last IS NOT NULL, p.reply_count DESC LIMIT ?""",
+            (name, since, until, fresh, a.max_post_pages))]
+        post_scrolls = a.post_scrolls or LIVE_POST_SCROLLS
+    print(f"post pages: {len(urls)} ({post_scrolls} scrolls each)")
     for url in urls:
-        await col.visit(url, f"post:{url}", a.post_scrolls)
+        await col.visit(url, f"post:{url}", post_scrolls)
         await polite_pause()
     print(f"tagged {st.tag_topic(topic)} on-topic posts")
 
@@ -860,7 +886,8 @@ def build_args():
     p.add_argument("--profile-scrolls", type=int, default=10)
     p.add_argument("--seed-scrolls", type=int, default=400,
                    help="max scrolls per seed profile when the topic has a period (stops at the period start)")
-    p.add_argument("--post-scrolls", type=int, default=10)
+    p.add_argument("--post-scrolls", type=int, default=None,
+                   help="scrolls per post page (default: 10 live, 40 for historical topics)")
     p.add_argument("--max-post-pages", type=int, default=30)
     p.add_argument("--max-profiles", type=int, default=30)
     p.add_argument("--max-locations", type=int, default=50)
