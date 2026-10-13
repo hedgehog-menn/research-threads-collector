@@ -112,8 +112,9 @@ CREATE TABLE IF NOT EXISTS visits (
     new_posts INTEGER,
     seen_posts INTEGER,
     status TEXT,        -- ok / login_wall / ui_error / error / timeout
-    n_responses INTEGER -- /graphql responses carrying posts during the visit (0 on a
-                        -- reply page = no reply batches loaded: likely throttled)
+    n_responses INTEGER, -- /graphql responses carrying posts during the visit
+    reached_end INTEGER  -- 1 if the page footer was visible at the end (list exhausted);
+                         -- no batches AND not reached_end on a reply page = throttled
 );
 CREATE INDEX IF NOT EXISTS idx_visits_target ON visits(kind, target);
 
@@ -154,7 +155,7 @@ POST_MIGRATIONS = {
 }
 USER_MIGRATIONS = {"lookup_reason": "TEXT"}
 TOPIC_MIGRATIONS = {"match": "TEXT"}
-VISIT_MIGRATIONS = {"n_responses": "INTEGER"}
+VISIT_MIGRATIONS = {"n_responses": "INTEGER", "reached_end": "INTEGER"}
 
 MEDIA_TYPES = {1: "image", 2: "video", 8: "carousel", 19: "text"}
 
@@ -316,11 +317,13 @@ class Store:
             )
         self.db.commit()
 
-    def log_visit(self, run_id, kind, target, started, new, seen, status, n_responses=None):
+    def log_visit(self, run_id, kind, target, started, new, seen, status, n_responses=None,
+                  reached_end=None):
         self.db.execute(
             """INSERT INTO visits(run_id, kind, target, started_at, finished_at, new_posts,
-                                  seen_posts, status, n_responses) VALUES (?,?,?,?,?,?,?,?,?)""",
-            (run_id, kind, target, started, now(), new, seen, status, n_responses),
+                                  seen_posts, status, n_responses, reached_end)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (run_id, kind, target, started, now(), new, seen, status, n_responses, reached_end),
         )
         self.db.commit()
 
@@ -506,7 +509,8 @@ MAX_HISTORY_OPENS = 3       # give up on a page after this many opens
 # Threads shows only part of the replies it counts (about 1 in 6 on big threads, in both
 # "Top" and "Recent" order; the rest are nested or hidden), so reply_count can't define
 # "complete". A page is done once a visit loaded reply batches; it's re-opened only when
-# the visit loaded none (n_responses = 0), which means reply loading was throttled.
+# the visit loaded none (n_responses = 0) AND never reached the page footer
+# (reached_end = 0) - small threads legitimately fit on the first screen.
 INLINE_REPLIES = 15         # a page with more replies than this should load reply batches
 THROTTLE_STREAK = 3         # this many reply pages in a row with no batches = throttled
 THROTTLE_PAUSE_S = 600      # back off this long the first time; skip the rest the second
@@ -568,6 +572,7 @@ class Collector:
         kind, _, target = source.partition(":")
         started, start_new, start_seen = now(), self.store.new_posts, self.store.seen_posts
         start_resp = self.post_responses
+        self.reached_end = None
         try:
             await asyncio.wait_for(self._visit(url, source, scrolls, stop_before),
                                    visit_timeout(scrolls))
@@ -588,11 +593,13 @@ class Collector:
                 raise TooManyFailures(f"{self.failures} page visits in a row failed")
             return
         self.failures = 0
+        n_resp = self.post_responses - start_resp
         self.store.log_visit(self.run_id, kind, target, started,
                              self.store.new_posts - start_new,
-                             self.store.seen_posts - start_seen, "ok",
-                             self.post_responses - start_resp)
-        return self.post_responses - start_resp
+                             self.store.seen_posts - start_seen, "ok", n_resp,
+                             self.reached_end)
+        # throttled = a scrollable page that loaded nothing more and never reached its end
+        return n_resp == 0 and not self.reached_end
 
     async def _visit(self, url: str, source: str, scrolls: int, stop_before: int | None = None):
         self.source = source
@@ -623,6 +630,10 @@ class Collector:
 
         await self._drain()
         self.store.commit()
+        try:  # page footer visible = the list ran out (not throttled)
+            self.reached_end = int(await self.page.get_by_text("Threads Terms").first.is_visible())
+        except Exception:
+            self.reached_end = None
         print(f"[{source}] +{self.store.new_posts - start} new posts  ({url})")
 
     async def fetch_country(self, username: str) -> bool:
@@ -816,7 +827,7 @@ async def snowball(col: Collector, topic: dict, a):
                SELECT p.url FROM posts p JOIN post_topics t ON t.post_pk = p.pk AND t.topic = ?
                LEFT JOIN got g ON g.url = p.url
                LEFT JOIN opens o ON o.target = p.url
-               LEFT JOIN (SELECT target, n_responses FROM visits v1
+               LEFT JOIN (SELECT target, n_responses, reached_end FROM visits v1
                           WHERE kind = 'post' AND status = 'ok' AND started_at =
                             (SELECT MAX(started_at) FROM visits v2 WHERE v2.kind = 'post'
                              AND v2.status = 'ok' AND v2.target = v1.target)) lv
@@ -824,7 +835,8 @@ async def snowball(col: Collector, topic: dict, a):
                WHERE t.on_topic = 1 AND p.found_as = 'result' AND p.is_reply = 0
                  AND p.url IS NOT NULL AND p.reply_count > 0 AND p.taken_at BETWEEN ? AND ?
                  AND (o.n IS NULL                                   -- never opened
-                      OR (lv.n_responses = 0 AND p.reply_count > ?  -- last visit throttled
+                      OR (lv.n_responses = 0 AND lv.reached_end = 0    -- last visit throttled
+                          AND p.reply_count > ?
                           AND COALESCE(g.n, 0) < ? * p.reply_count AND o.n < ?))
                ORDER BY o.n IS NOT NULL, p.reply_count DESC LIMIT ?""",
             (name, since, until, INLINE_REPLIES, REPLY_COMPLETE, MAX_HISTORY_OPENS,
@@ -850,10 +862,10 @@ async def snowball(col: Collector, topic: dict, a):
         f"({','.join('?' * len(urls))})", urls).fetchall()) if urls else {}
     streak, backed_off = 0, False
     for url in urls:
-        n_resp = await col.visit(url, f"post:{url}", post_scrolls)
+        throttled = await col.visit(url, f"post:{url}", post_scrolls)
         await polite_pause()
         if (replies_of.get(url) or 0) > INLINE_REPLIES:
-            streak = streak + 1 if n_resp == 0 else 0
+            streak = streak + 1 if throttled else 0
         if streak >= THROTTLE_STREAK:
             if backed_off:
                 print(f"reply loading still throttled after a pause - skipping the remaining "
