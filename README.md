@@ -47,6 +47,7 @@ Global options go **before** the command, as in `python threads_collector.py --h
 - `--headful` shows the browser window. It's useful when a page layout changes and something stops working.
 - `--dump-raw raw/` saves every raw payload so you can inspect the data format.
 - `snowball --only-posts` opens only reply pages (no searches, seed profiles, replier profiles or location lookups), to work through unopened reply pages.
+- `snowball --only-locations --max-locations 100` runs a location **sweep** batch: the next 100 unchecked on-topic authors in a fixed random order (`lookup_reason = sweep`), so a sweep stopped part-way is still a random sample.
 - `--db`, `--auth` use a different database or session file.
 
 `+N new posts` counts only posts that weren't already in the database. Posts you've already collected still get fresh counts and a new snapshot.

@@ -27,6 +27,7 @@ check the schema.
 """
 import argparse
 import asyncio
+import hashlib
 import calendar
 import json
 import random
@@ -749,6 +750,28 @@ def load_topic(path) -> dict:
     return topic
 
 
+def pick_sweep(st: "Store", topic: dict, n: int):
+    """Next n unchecked on-topic authors (study period if the topic has one) for a full
+    location sweep. The order is a fixed pseudo-random shuffle (hash of topic + username),
+    so batches continue the same list, and a sweep stopped part-way is still a random
+    sample. Records users.lookup_reason = 'sweep'."""
+    where_period = "AND p.taken_at BETWEEN ? AND ?" if topic["period_ts"] else ""
+    params = [topic["name"], *(topic["period_ts"] or ()), json.dumps(topic["exclude_users"])]
+    users = [r[0] for r in st.db.execute(
+        f"""SELECT DISTINCT p.username FROM posts p JOIN post_topics t
+              ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1
+            JOIN users u ON u.pk = p.user_pk
+            WHERE u.country_checked_at IS NULL {where_period}
+              AND p.username NOT IN (SELECT value FROM json_each(?))""", params)]
+    key = lambda u: hashlib.sha256(f"{topic['name']}:{u}".encode()).hexdigest()  # noqa: E731
+    picks = sorted(users, key=key)[:n]
+    st.db.executemany("UPDATE users SET lookup_reason = 'sweep' WHERE username = ?",
+                      [(u,) for u in picks])
+    st.commit()
+    print(f"location sweep: {len(picks)} this batch, {len(users) - len(picks)} left after it")
+    return picks
+
+
 def pick_lookups(st: "Store", topic: dict, run_id: str, n: int):
     """Choose up to n users for location lookups: half copy-cluster members, half a random
     sample of other on-topic authors (seeded with run_id). Records users.lookup_reason."""
@@ -787,13 +810,15 @@ async def snowball(col: Collector, topic: dict, a):
     print(f"== run {col.run_id}  topic={name}" + ("  (post pages only)" if a.only_posts else ""))
     if a.only_posts:  # reply pages only: no searches, seeds, profiles or location lookups
         a.max_profiles = a.max_locations = 0
+    if a.only_locations:  # location sweep only: no searches, seeds, reply pages or profiles
+        a.max_profiles = a.max_post_pages = 0
 
-    for kw in ([] if a.only_posts else topic["search"]):
+    for kw in ([] if a.only_posts or a.only_locations else topic["search"]):
         for mode in topic["search_modes"]:  # "recent" = newest first, "top" = Threads' ranking
             kind = "search" if mode == "recent" else "search_top"
             await col.visit(search_url(kw, recent=mode == "recent"), f"{kind}:{kw}", a.search_scrolls)
             await polite_pause()
-    for u in ([] if a.only_posts else topic["seeds"]):
+    for u in ([] if a.only_posts or a.only_locations else topic["seeds"]):
         if topic["period_ts"]:
             # Scroll back to the period start until some visit has actually reached it;
             # after that, only back to the last visit (a shallow earlier visit - e.g. a
@@ -909,12 +934,15 @@ async def snowball(col: Collector, topic: dict, a):
         # authors (a fair baseline - looking up only cluster members skewed the country mix).
         # lookup_reason records which half each user came from; the random draw is seeded
         # with the run id so it can be reproduced.
-        picks = pick_lookups(st, topic, col.run_id, a.max_locations)
-        n_cluster = sum(why == "cluster" for _, why in picks)
-        n_random = len(picks) - n_cluster
-        todo = [u for u, _ in picks]
-        print(f"location lookups: {len(todo)} ({n_cluster} copy-cluster members, "
-              f"{n_random} random on-topic authors)")
+        if a.only_locations:
+            todo = pick_sweep(st, topic, a.max_locations)
+        else:
+            picks = pick_lookups(st, topic, col.run_id, a.max_locations)
+            n_cluster = sum(why == "cluster" for _, why in picks)
+            n_random = len(picks) - n_cluster
+            todo = [u for u, _ in picks]
+            print(f"location lookups: {len(todo)} ({n_cluster} copy-cluster members, "
+                  f"{n_random} random on-topic authors)")
         await col.locations(todo)
 
     row = st.db.execute(
@@ -950,6 +978,9 @@ def build_args():
     p.add_argument("--max-post-pages", type=int, default=30)
     p.add_argument("--only-posts", action="store_true",
                    help="only open reply pages (skip searches, seeds, profiles, location lookups)")
+    p.add_argument("--only-locations", action="store_true",
+                   help="only look up countries of unchecked on-topic authors, in a fixed random "
+                        "order (a sweep; batch size = --max-locations)")
     p.add_argument("--max-profiles", type=int, default=30)
     p.add_argument("--max-locations", type=int, default=50)
     p.add_argument("--revisit-days", type=int, default=14, help="re-open post pages of on-topic posts up to this old")
