@@ -301,6 +301,51 @@ def main():
     jul25_rand = one("""SELECT COUNT(*) FROM user_features f JOIN users u ON u.pk = f.user_pk
                         WHERE f.joined_month = '2025-07' AND u.lookup_reason = 'random'""")
     n_rand = one("SELECT COUNT(*) FROM users WHERE lookup_reason = 'random' AND country_checked_at IS NOT NULL")
+    # location coverage by role, and by why the account was looked up
+    cov = {}
+    for role, cond in (("Replied to an on-topic post", "p.is_reply = 1"),
+                       ("Wrote an on-topic original post", "p.is_reply = 0"),
+                       ("All on-topic authors", "1 = 1")):
+        cov[role] = q(f"""SELECT COUNT(*), SUM(u.country_checked_at IS NOT NULL), SUM(u.country IS NOT NULL)
+                          FROM users u WHERE u.pk IN (SELECT p.user_pk FROM posts p {ON} WHERE {PER} AND {cond})""")[0]
+    by_reason = q("""SELECT CASE COALESCE(lookup_reason, '') WHEN 'cluster' THEN 'Copy-cluster members'
+                            WHEN 'random' THEN 'Random sample of on-topic authors'
+                            WHEN 'sweep' THEN 'Full-check sweep (test batch)'
+                            ELSE 'Prioritized (most active, before the 50/50 split)' END,
+                            COUNT(*), SUM(country IS NOT NULL)
+                     FROM users WHERE country_checked_at IS NOT NULL GROUP BY 1 ORDER BY 2 DESC""")
+    sweep_done = one("SELECT COUNT(*) FROM users WHERE lookup_reason = 'sweep' AND country_checked_at IS NOT NULL")
+    to_check = cov["All on-topic authors"][0] - cov["All on-topic authors"][1]
+    lookup_s = one("SELECT AVG(finished_at - started_at) FROM visits WHERE kind = 'location' AND status = 'ok'")
+    per_lookup = lookup_s + 6.5  # plus the average polite pause between targets (4-9 s)
+    sweep_hours = to_check * per_lookup / 3600
+    batches = -(-to_check // 100)
+    sweep_wall_h = batches * (100 * per_lookup / 3600 + 25 / 60)
+    # why accounts were seen but are not on-topic authors in the period
+    origin = q(f"""
+        WITH onp AS (SELECT DISTINCT p.user_pk FROM posts p {ON} WHERE {PER}),
+             ona AS (SELECT DISTINCT p.user_pk FROM posts p {ON}),
+             firsts AS (SELECT user_pk, MIN(first_scraped_at) t FROM posts GROUP BY user_pk)
+        SELECT reason, COUNT(*) FROM (
+          SELECT u.pk, CASE
+            WHEN u.pk IN (SELECT user_pk FROM ona) THEN 'On-topic, but only outside the study period'
+            WHEN u.pk NOT IN (SELECT user_pk FROM posts) THEN 'Seen only as a profile (no post saved)'
+            ELSE (SELECT CASE
+                WHEN p.found_as IN ('quoted', 'parent') THEN 'Their post was quoted, or was the parent shown above a reply'
+                WHEN p.source LIKE 'search%' THEN 'In a topic search, but the post failed the on-topic rule'
+                WHEN p.source LIKE 'post:%' THEN 'Replied under a post that is not on-topic'
+                ELSE 'Appeared on a profile that was opened' END
+              FROM posts p JOIN firsts f ON f.user_pk = p.user_pk AND f.t = p.first_scraped_at
+              WHERE p.user_pk = u.pk LIMIT 1) END AS reason
+          FROM users u WHERE u.pk NOT IN (SELECT user_pk FROM onp)) GROUP BY reason ORDER BY 2 DESC""")
+    search_fail = q(f"""
+        WITH onp AS (SELECT DISTINCT p.user_pk FROM posts p {ON} WHERE {PER})
+        SELECT COUNT(DISTINCT CASE WHEN f.lang = 'en' AND (p.taken_at < strftime('%s','{per['from']}')
+                    OR p.taken_at >= strftime('%s','{per['to']}','+1 day')) THEN p.user_pk END),
+               COUNT(DISTINCT CASE WHEN f.lang != 'en' THEN p.user_pk END)
+        FROM posts p JOIN post_topics t ON t.post_pk = p.pk AND t.topic = '{name}' AND t.on_topic = 0
+        JOIN post_features f ON f.post_pk = p.pk
+        WHERE p.source LIKE 'search%' AND p.user_pk NOT IN (SELECT user_pk FROM onp)""")[0]
     ai = Counter(dict(q(f"SELECT COALESCE(p.ai_label,'(missing)'), COUNT(*) FROM posts p {ON} WHERE {PER} GROUP BY 1")))
     seeds = topic["seeds"]
 
@@ -473,7 +518,7 @@ def main():
         "December 2025).")
     table(doc, ["Measure", "Value"], [
         ("Posts collected (all)", f"{n_posts:,}"),
-        ("Accounts seen", f"{n_users:,}"),
+        ("Accounts seen (all pages opened)", f"{n_users:,}"),
         ("On-topic posts in the study period", f"{n_on:,} from {n_on_acc:,} accounts"),
         ("…matched by keywords (English originals)", f"{n_kw:,}"),
         ("…replies under those posts (any language)", f"{n_thread:,}"),
@@ -529,6 +574,20 @@ def main():
         "tagged, not deleted. A hand check of random on-topic posts found them relevant; posts that rely "
         "on 'ASEAN' alone as the conflict term are about 20% false positives (3 of 15).")
 
+    doc.add_heading("Accounts in the dataset", level=2)
+    doc.add_paragraph(
+        f"The collector saved {n_users:,} accounts, but only {n_on_acc:,} wrote an on-topic post in the "
+        "study period. All searches were topic-related; the difference comes from everything else the "
+        "opened pages show, which is kept and tagged off-topic rather than deleted:")
+    table(doc, ["Why the account is not among the on-topic authors", "Accounts"],
+          [(r, f"{n:,}") for r, n in origin], [12.5, 3.0])
+    doc.add_paragraph(
+        f"Most search hits that failed the rule are on the topic but outside the date window: "
+        f"{search_fail[0]:,} accounts wrote English posts about the conflict after January 2026 (the "
+        f"ceasefire and maritime-talk phase), and {search_fail[1]:,} wrote short, emoji-only or non-English "
+        "replies that the keyword rule can't classify. Extending the study period into 2026 would bring "
+        "many of them in with no new collection, only a re-tag.")
+
     doc.add_heading("3. What the data shows", level=1)
     doc.add_heading("Timeline", level=2)
     figure(doc, fig_paths["monthly"], "Figure 1. On-topic posts per month. Blue: posts matched by "
@@ -558,6 +617,34 @@ def main():
         f"({ck} of {ck + ct + co}). Caveats: the cluster group is partly circular (clusters were found in "
         "Cambodian-side texts), the groups are small, and only English original posts were searched, so "
         "Thai-language campaigns would not be visible.")
+
+    doc.add_heading("Location coverage and the planned full check", level=2)
+    doc.add_paragraph(
+        "Threads does not send an author's country with their posts or replies. It appears only in each "
+        "profile's 'About this profile' panel, so every country needs its own lookup: open the profile, "
+        f"open the menu and the panel, then read it. That takes about {lookup_s:.0f} seconds plus the "
+        "polite pause, and repeated menu clicks are the collection step most likely to get the research "
+        "account flagged. Lookups were therefore kept to 50 per collection round.")
+    table(doc, ["On-topic accounts in the study period", "Accounts", "Location checked", "Have a country", "Share"],
+          [(role, f"{n:,}", f"{c:,}", f"{w:,}", f"{100 * w / n:.1f}%") for role, (n, c, w) in cov.items()],
+          [6.4, 2.2, 2.6, 2.6, 1.8])
+    table(doc, ["Why the account was checked", "Checked", "Have a country"],
+          [(r, n, w) for r, n, w in by_reason], [9.6, 3.0, 3.0])
+    doc.add_paragraph(
+        "Only the random sample (and the sweep, below) can describe on-topic authors as a whole; the "
+        "prioritized and copy-cluster lookups were chosen on purpose and are not representative.")
+    p = doc.add_paragraph()
+    p.add_run("Full check (prepared, paused). ").bold = True
+    p.add_run(
+        f"A location-only mode now checks every unchecked on-topic author, {to_check:,} accounts, in a "
+        "fixed random order, so the accounts checked so far always form a random sample even if the sweep "
+        f"stops part-way. At about {per_lookup:.0f} seconds per account that is roughly {sweep_hours:.0f} "
+        f"hours of lookups; in safe batches of 100 with 25-minute breaks, about {batches} batches over "
+        f"{sweep_wall_h:.0f} hours ({sweep_wall_h / 24:.1f} days) with the laptop awake. A test batch ran "
+        f"cleanly ({sweep_done} lookups, all successful, no blocking) and was paused for this report. "
+        "The sweep stops by itself at a login wall or after 3 failed lookups in a row. A cheaper "
+        "alternative: about 400 random accounts would estimate country shares to within about 5 "
+        "percentage points.")
 
     doc.add_heading("Coordination signals", level=2)
     figure(doc, fig_paths["clusters"], "Figure 5. Copy-paste clusters: number of accounts posting the "
@@ -601,8 +688,10 @@ def main():
         ("English originals only. ", "Thai- and Khmer-language original posts were not searched; Thai-side "
          "campaigns are probably under-represented."),
         ("'Top' search favors popular posts. ", "Seed-outlet timelines reduce this bias but don't remove it."),
-        ("Location covers few accounts. ", f"{checked} of {n_on_acc:,} on-topic authors "
-         f"({100 * checked / n_on_acc:.1f}%) were checked; lookups are slow and account-sensitive."),
+        ("Location covers few accounts. ", f"{cov['All on-topic authors'][1]:,} of {n_on_acc:,} on-topic "
+         f"authors ({100 * cov['All on-topic authors'][1] / n_on_acc:.1f}%) were checked, and only "
+         f"{100 * cov['Replied to an on-topic post'][2] / cov['Replied to an on-topic post'][0]:.1f}% of "
+         "repliers have a country; a full check is prepared (section 3)."),
         ("Throttling. ", "Reply loading was throttled after searches; searches and reply pages now run in "
          "separate sessions."),
         ("AI labels are disclosures. ", f"ai_label = NONE ({ai.get('NONE', 0):,} on-topic posts) does not "
@@ -632,6 +721,12 @@ def main():
         ("Scope: ", "add Thai and Khmer original posts? The multilingual hashtag campaigns suggest the main "
          "activity is not English-only."),
         ("Data source: ", "continue scraping, or move to Meta Content Library if approved?"),
+        ("Country for every account? ", f"Run the full location check ({to_check:,} accounts, about "
+         f"{sweep_wall_h / 24:.1f} days, some risk to the research account), or settle for a random sample "
+         "of about 400 (within about 5 points)? This decides whether country can be a per-account "
+         "feature for the classifiers."),
+        ("Study period: ", "extend into 2026 (the ceasefire and maritime-talk phase) to add a 'long after' "
+         "phase for drift?"),
     ])
 
     out = a.out / "threads_dataset_report.docx"
