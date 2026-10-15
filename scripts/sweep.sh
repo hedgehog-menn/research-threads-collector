@@ -3,6 +3,7 @@
 #   scripts/sweep.sh [topic] [batch size] [break minutes]
 # Stops when nothing is left, on a login wall (exit 2), on repeated page failures (exit 3),
 # or when a batch stops early after 3 failed lookups in a row (possible blocking).
+# Keeps lookups in any rolling 24 h under THREADS_DAILY_LOOKUPS (default 800).
 # Run it under a sleep blocker, e.g.:
 #   systemd-run --user --unit=threads-sweep systemd-inhibit --what=idle:sleep scripts/sweep.sh
 set -uo pipefail
@@ -11,9 +12,19 @@ PY="${THREADS_PY:-$HOME/.conda/envs/threads-scraper/bin/python}"
 TOPIC="${1:-topics/th_kh_border_en.json}"
 BATCH="${2:-100}"
 BREAK_MIN="${3:-25}"
+# Threads limits "About this profile": about 925 lookups ran fine, then failures came in
+# threes, and only cleared after ~24 h. Keep lookups in any rolling 24 h under this budget.
+DAILY="${THREADS_DAILY_LOOKUPS:-800}"
+DB="${THREADS_DB:-threads.db}"
 mkdir -p logs
 n=0
 while true; do
+  while true; do
+    used=$(sqlite3 "$DB" "SELECT COUNT(*) FROM visits WHERE kind = 'location' AND started_at > strftime('%s','now') - 86400")
+    [ "$((used + BATCH))" -le "$DAILY" ] && break
+    echo "--- $(date -Is) daily budget: $used of $DAILY lookups used in the last 24 h; waiting 30 min" | tee -a "logs/$(date +%F).log"
+    sleep 1800
+  done
   n=$((n + 1))
   LOG="logs/$(date +%F).log"
   OUT=$(mktemp)

@@ -62,6 +62,9 @@ Resolved 2026-10-10: a round froze for 32 h (no sleep, network fine) waiting on 
 
 Resolved: the location lookup clicked the sidebar's "More" button instead of the profile's; that's fixed. The old test data was moved to `threads_test.db`; the demo collects into a fresh `threads.db`.
 
+## Location sweep (2026-10-14 onwards)
+`scripts/sweep.sh` (run under `systemd-inhibit`) checks every unchecked on-topic author in a fixed random order (`lookup_reason = 'sweep'`), 100 per batch with 25-min breaks. **Threads rate-limits "About this profile":** about 925 lookups ran cleanly (2026-10-14 15:20 to 00:00), then failures came three in a row; after a 2 h rest only 7 more worked; after 24 h the same failed account (samnang_ch) opened fine ("Based in Cambodia"). So it looks like a rolling daily quota of roughly 900–950. The sweep now keeps at most `THREADS_DAILY_LOOKUPS` (default 800) lookups per rolling 24 h. Failed (`ui_error`) sweep lookups are reset to unchecked so they get retried. `scripts/sweep_resume.sh` does one test lookup before resuming after a stop.
+
 ## Verified numbers (2026-10-13, after all reply pages were opened)
 Use these; older figures elsewhere in chat history are superseded.
 - Study period on-topic: **9,211 posts from 3,905 accounts** = **2,952 keyword-matched + 6,259 thread replies** (after adding the plural "Peace Accords" terms; before that 9,208 = 2,949 + 6,259). 6,281 is the *all-dates* thread-reply count, not the study-period one.
