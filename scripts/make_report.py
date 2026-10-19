@@ -310,7 +310,7 @@ def main():
                           FROM users u WHERE u.pk IN (SELECT p.user_pk FROM posts p {ON} WHERE {PER} AND {cond})""")[0]
     by_reason = q("""SELECT CASE COALESCE(lookup_reason, '') WHEN 'cluster' THEN 'Copy-cluster members'
                             WHEN 'random' THEN 'Random sample of on-topic authors'
-                            WHEN 'sweep' THEN 'Full-check sweep (test batch)'
+                            WHEN 'sweep' THEN 'Location sweep (all remaining on-topic authors)'
                             ELSE 'Prioritized (most active, before the 50/50 split)' END,
                             COUNT(*), SUM(country IS NOT NULL)
                      FROM users WHERE country_checked_at IS NOT NULL GROUP BY 1 ORDER BY 2 DESC""")
@@ -348,6 +348,29 @@ def main():
         WHERE p.source LIKE 'search%' AND p.user_pk NOT IN (SELECT user_pk FROM onp)""")[0]
     ai = Counter(dict(q(f"SELECT COALESCE(p.ai_label,'(missing)'), COUNT(*) FROM posts p {ON} WHERE {PER} GROUP BY 1")))
     seeds = topic["seeds"]
+
+    # ---- whole-population location results (meaningful once the sweep is complete)
+    complete = to_check == 0
+    AUTH = f"SELECT DISTINCT p.user_pk FROM posts p {ON} WHERE {PER}"
+    pop_countries = q(f"""SELECT COALESCE(u.country, '(no country)'), COUNT(*) FROM users u
+                          WHERE u.pk IN ({AUTH}) GROUP BY 1 ORDER BY 2 DESC""")
+    sig = {}
+    for g_name, g_n, g_cp, g_ct, g_rp, g_j7, g_jp in q(f"""
+            SELECT CASE WHEN u.country IN ('Cambodia','Thailand') THEN u.country ELSE 'Other / none' END, COUNT(*),
+                   SUM(f.n_copy_posts > 0), SUM(f.n_campaign_tags > 0), SUM(f.n_rare_tag_partners > 0),
+                   SUM(f.joined_month = '2025-07'), SUM(f.joined_in_period)
+            FROM users u JOIN user_features f ON f.user_pk = u.pk WHERE u.pk IN ({AUTH}) GROUP BY 1"""):
+        sig[g_name] = dict(n=g_n, copy=g_cp or 0, campaign=g_ct or 0, rare=g_rp or 0, jul25=g_j7 or 0,
+                           in_period=g_jp or 0)
+    SIGNALS = [("copy", "In a copy-paste cluster"), ("campaign", "Uses campaign hashtags"),
+               ("rare", "Shares rare hashtags"), ("jul25", "Joined Threads in July 2025")]
+    sig_tests = {}
+    if "Cambodia" in sig and "Thailand" in sig:
+        K, T = sig["Cambodia"], sig["Thailand"]
+        for key, _ in SIGNALS:
+            a_, b_, c_, d_ = K[key], K["n"] - K[key], T[key], T["n"] - T[key]
+            sig_tests[key] = ((a_ * d_) / (b_ * c_) if b_ and c_ else float("inf"), fisher_two_sided(a_, b_, c_, d_))
+    pct = lambda grp, key: 100 * sig[grp][key] / sig[grp]["n"] if grp in sig and sig[grp]["n"] else 0  # noqa: E731
 
     # ---- charts
     fig_paths = {}
@@ -414,7 +437,46 @@ def main():
     fig_paths["langs"] = a.out / "fig_3_reply_languages.png"
     save(fig, fig_paths["langs"])
 
-    # 4 countries: cluster vs random
+    # 4 countries: whole population when the sweep is complete, else cluster vs random
+    if complete:
+        fig, ax = new_fig(8.0, 3.6)
+        style_axes(ax, ygrid=False)
+        ax.xaxis.grid(True, color=GRID, lw=0.8)
+        top = pop_countries[:8]
+        rest = sum(n for _, n in pop_countries[8:])
+        items = top + ([("Other countries", rest)] if rest else [])
+        ys = range(len(items))[::-1]
+        ax.barh(list(ys), [n for _, n in items], height=0.55, color=S1, zorder=2)
+        ax.set_yticks(list(ys), [c for c, _ in items])
+        tot_a = sum(n for _, n in pop_countries)
+        for yv, (_, n) in zip(ys, items):
+            ax.annotate(f"{n:,} ({100 * n / tot_a:.0f}%)", (n, yv), xytext=(4, 0), textcoords="offset points",
+                        va="center", fontsize=8.5, color=INK)
+        ax.set_xlim(0, max(n for _, n in items) * 1.25)
+        titles(ax, "Where on-topic authors are based", f"All {tot_a:,} on-topic authors, 'Based in' country")
+        fig_paths["countries"] = a.out / "fig_4_countries.png"
+        save(fig, fig_paths["countries"])
+
+        fig, ax = new_fig(8.6, 3.6)
+        xs = range(len(SIGNALS))
+        w = 0.34
+        kv = [pct("Cambodia", k) for k, _ in SIGNALS]
+        tv = [pct("Thailand", k) for k, _ in SIGNALS]
+        ax.bar([i - w / 2 - 0.01 for i in xs], kv, width=w, color=S1, label="Based in Cambodia", zorder=2)
+        ax.bar([i + w / 2 + 0.01 for i in xs], tv, width=w, color=S2, label="Based in Thailand", zorder=2)
+        for i, (u, v) in enumerate(zip(kv, tv)):
+            ax.annotate(f"{u:.1f}%", (i - w / 2, u), xytext=(0, 3), textcoords="offset points", ha="center", fontsize=8, color=INK)
+            ax.annotate(f"{v:.1f}%", (i + w / 2, v), xytext=(0, 3), textcoords="offset points", ha="center", fontsize=8, color=INK)
+        ax.set_xticks(list(xs), [lab for _, lab in SIGNALS], fontsize=8)
+        ax.set_ylim(0, max(kv + tv) * 1.3)
+        titles(ax, "Coordination and account-age signals, by country",
+               f"Share of on-topic authors with each signal · Cambodia n = {sig['Cambodia']['n']:,}, "
+               f"Thailand n = {sig['Thailand']['n']:,}")
+        leg = ax.legend(frameon=False, fontsize=8, loc="upper right")
+        [t.set_color(INK2) for t in leg.get_texts()]
+        fig_paths["signals"] = a.out / "fig_4b_signals_by_country.png"
+        save(fig, fig_paths["signals"])
+
     fig, ax = new_fig(7.6, 3.4)
     cats = ["Cambodia", "Thailand", "Other"]
     xs = range(len(cats))
@@ -431,8 +493,12 @@ def main():
            f"OR = {odds:.2f}, p = {p_fisher:.1e}")
     leg = ax.legend(frameon=False, fontsize=8, loc="upper right")
     [t.set_color(INK2) for t in leg.get_texts()]
-    fig_paths["countries"] = a.out / "fig_4_countries.png"
-    save(fig, fig_paths["countries"])
+    if not complete:
+        fig_paths["countries"] = a.out / "fig_4_countries.png"
+        save(fig, fig_paths["countries"])
+    else:
+        fig_paths["cluster_random"] = a.out / "fig_4c_cluster_vs_random.png"
+        save(fig, fig_paths["cluster_random"])
 
     # 5 top hashtags
     fig, ax = new_fig(8.6, 4.2)
@@ -491,7 +557,7 @@ def main():
     ax.set_xticks([i for i, mo in enumerate(allm) if mo.endswith(("-01", "-07"))],
                   [MONTHS[int(mo[5:]) - 1] + f"\n{mo[:4]}" for mo in allm if mo.endswith(("-01", "-07"))])
     titles(ax, "When the location-checked accounts joined Threads",
-           f"n = {n_join}; shaded = fighting months; July 2023 = Threads launch wave")
+           f"n = {n_join:,}; shaded = fighting months; July 2023 = Threads launch wave")
     fig_paths["joins"] = a.out / "fig_7_join_months.png"
     save(fig, fig_paths["joins"])
 
@@ -522,7 +588,7 @@ def main():
         ("On-topic posts in the study period", f"{n_on:,} from {n_on_acc:,} accounts"),
         ("…matched by keywords (English originals)", f"{n_kw:,}"),
         ("…replies under those posts (any language)", f"{n_thread:,}"),
-        ("Accounts with a 'Based in' country check", f"{checked} ({100 * with_c / checked:.0f}% show a country)"),
+        ("Accounts with a 'Based in' country check", f"{checked:,} ({100 * with_c / checked:.0f}% show a country)"),
         ("Cross-account copy-paste clusters", f"{len(multi)} ({n_multi_on} with on-topic posts), up to {max_acc} accounts"),
         ("Campaign hashtags (20+ accounts)", f"{n_campaign}"),
         ("Page loads", f"{n_visits:,} in {n_rounds} collection rounds, {first_run} to {last_run}; {n_ok:,} ok, no login walls"),
@@ -533,9 +599,20 @@ def main():
          f"{phase_rows[1][4]:g} posts per day in July 2025 and {phase_rows[3][4]:g} in December 2025, "
          f"against {phase_rows[0][4]:g} before the fighting."),
         ("Most of the volume is replies. ", f"{n_thread:,} of {n_on:,} on-topic posts are replies, many in Thai or Khmer."),
-        ("Both sides take part; English copy-paste comes from one. ", f"A random sample of on-topic authors is "
-         f"split {rt} Thailand / {rk} Cambodia, but copy-paste cluster members are {ck} Cambodia / {ct} Thailand "
-         f"(Fisher exact OR = {odds:.2f}, p = {p_fisher:.1e})."),
+        ("Both sides take part; English copy-paste comes from one. ", (
+            f"Of all {sum(n for _, n in pop_countries):,} on-topic authors, "
+            f"{100 * dict(pop_countries).get('Cambodia', 0) / sum(n for _, n in pop_countries):.0f}% are based in "
+            f"Cambodia and {100 * dict(pop_countries).get('Thailand', 0) / sum(n for _, n in pop_countries):.0f}% in "
+            f"Thailand, but {pct('Cambodia', 'copy'):.0f}% of Cambodia-based authors appear in copy-paste clusters "
+            f"against {pct('Thailand', 'copy'):.1f}% of Thailand-based ones (Fisher exact OR = "
+            f"{sig_tests['copy'][0]:.1f}, p = {sig_tests['copy'][1]:.0e}).") if complete else (
+            f"A random sample of on-topic authors is split {rt} Thailand / {rk} Cambodia, but copy-paste cluster "
+            f"members are {ck} Cambodia / {ct} Thailand (Fisher exact OR = {odds:.2f}, p = {p_fisher:.1e}).")),
+        ("A wave of new accounts at the start of the fighting. ", (
+            f"{pct('Cambodia', 'jul25'):.0f}% of Cambodia-based authors created their Threads account in July 2025, "
+            f"against {pct('Thailand', 'jul25'):.1f}% of Thailand-based ones (OR = {sig_tests['jul25'][0]:.1f}, "
+            f"p = {sig_tests['jul25'][1]:.0e}); there is no such wave in December.") if complete else
+            "Accounts created in July 2025 are a lead to follow up (see Account age)."),
         ("Coordinated hashtags run in three languages. ", "The same 'Thailand started the war' slogan appears as "
          "English, Thai and Khmer hashtags used by 200-300 accounts each, and whole sentences turned into "
          "hashtags are shared by about 100 accounts."),
@@ -605,46 +682,81 @@ def main():
     figure(doc, fig_paths["langs"], "Figure 3. Detected languages of the replies under on-topic posts.")
 
     doc.add_heading("Who takes part, and where they are based", level=2)
-    doc.add_paragraph(
-        f"{checked} accounts were location-checked; {100 * with_c / checked:.0f}% show a 'Based in' country "
-        "(the rest hide it or have no such row). The country is set by Meta, not typed by the user. "
-        "Only the 'random' group is a fair sample of on-topic authors.")
-    figure(doc, fig_paths["countries"], "Figure 4. 'Based in' country of copy-cluster members and of a "
-           "random sample of on-topic authors.")
-    doc.add_paragraph(
-        f"Reading: Thai- and Cambodia-based accounts take part about equally ({rt} vs {rk} in the random "
-        f"group), but English-language copy-paste comes almost entirely from Cambodia-based accounts "
-        f"({ck} of {ck + ct + co}). Caveats: the cluster group is partly circular (clusters were found in "
-        "Cambodian-side texts), the groups are small, and only English original posts were searched, so "
-        "Thai-language campaigns would not be visible.")
+    if complete:
+        tot_a = sum(n for _, n in pop_countries)
+        doc.add_paragraph(
+            f"Every on-topic author ({tot_a:,} accounts) was location-checked, and "
+            f"{100 * (tot_a - dict(pop_countries).get('(no country)', 0)) / tot_a:.0f}% show a 'Based in' "
+            "country (the rest hide it or have no such row). The country is set by Meta, not typed by the user.")
+        figure(doc, fig_paths["countries"], "Figure 4. 'Based in' country of all on-topic authors.")
+        figure(doc, fig_paths["signals"], "Figure 4b. Share of Cambodia- and Thailand-based authors with "
+               "each coordination or account-age signal.")
+        table(doc, ["Signal", "Cambodia-based", "Thailand-based", "Other / none", "Odds ratio KH vs TH", "p (Fisher)"],
+              [(lab, f"{pct('Cambodia', k):.1f}%", f"{pct('Thailand', k):.1f}%", f"{pct('Other / none', k):.1f}%",
+                f"{sig_tests[k][0]:.1f}", f"{sig_tests[k][1]:.0e}") for k, lab in SIGNALS],
+              [4.6, 2.3, 2.3, 2.2, 2.6, 2.0], font_pt=8)
+        doc.add_paragraph(
+            "Reading: both sides take part in about equal numbers, but coordination signals are far more "
+            "common among Cambodia-based authors: copy-paste and campaign hashtags most of all, and to a "
+            "lesser degree shared rare hashtags, which also appear on the Thai side. Each location lookup "
+            "opened the author's profile and saved its visible posts, so these signals are measured the same "
+            "way for every author. Caveats: only English original posts were searched, so Thai-language "
+            "campaigns are under-represented; and coordination is not proof of fake accounts.")
+    else:
+        doc.add_paragraph(
+            f"{checked} accounts were location-checked; {100 * with_c / checked:.0f}% show a 'Based in' country "
+            "(the rest hide it or have no such row). The country is set by Meta, not typed by the user. "
+            "Only the 'random' group is a fair sample of on-topic authors.")
+        figure(doc, fig_paths["countries"], "Figure 4. 'Based in' country of copy-cluster members and of a "
+               "random sample of on-topic authors.")
+        doc.add_paragraph(
+            f"Reading: Thai- and Cambodia-based accounts take part about equally ({rt} vs {rk} in the random "
+            f"group), but English-language copy-paste comes almost entirely from Cambodia-based accounts "
+            f"({ck} of {ck + ct + co}). Caveats: the cluster group is partly circular (clusters were found in "
+            "Cambodian-side texts), the groups are small, and only English original posts were searched, so "
+            "Thai-language campaigns would not be visible.")
 
-    doc.add_heading("Location coverage and the planned full check", level=2)
+    doc.add_heading("Location coverage" + ("" if complete else " and the planned full check"), level=2)
     doc.add_paragraph(
         "Threads does not send an author's country with their posts or replies. It appears only in each "
         "profile's 'About this profile' panel, so every country needs its own lookup: open the profile, "
         f"open the menu and the panel, then read it. That takes about {lookup_s:.0f} seconds plus the "
         "polite pause, and repeated menu clicks are the collection step most likely to get the research "
-        "account flagged. Lookups were therefore kept to 50 per collection round.")
+        "account flagged. Lookups were first kept to 50 per collection round" + (
+            ", then a dedicated sweep checked every remaining on-topic author." if complete else "."))
     table(doc, ["On-topic accounts in the study period", "Accounts", "Location checked", "Have a country", "Share"],
           [(role, f"{n:,}", f"{c:,}", f"{w:,}", f"{100 * w / n:.1f}%") for role, (n, c, w) in cov.items()],
           [6.4, 2.2, 2.6, 2.6, 1.8])
     table(doc, ["Why the account was checked", "Checked", "Have a country"],
-          [(r, n, w) for r, n, w in by_reason], [9.6, 3.0, 3.0])
-    doc.add_paragraph(
-        "Only the random sample (and the sweep, below) can describe on-topic authors as a whole; the "
-        "prioritized and copy-cluster lookups were chosen on purpose and are not representative.")
-    p = doc.add_paragraph()
-    p.add_run("Full check (prepared, paused). ").bold = True
-    p.add_run(
-        f"A location-only mode now checks every unchecked on-topic author, {to_check:,} accounts, in a "
-        "fixed random order, so the accounts checked so far always form a random sample even if the sweep "
-        f"stops part-way. At about {per_lookup:.0f} seconds per account that is roughly {sweep_hours:.0f} "
-        f"hours of lookups; in safe batches of 100 with 25-minute breaks, about {batches} batches over "
-        f"{sweep_wall_h:.0f} hours ({sweep_wall_h / 24:.1f} days) with the laptop awake. A test batch ran "
-        f"cleanly ({sweep_done} lookups, all successful, no blocking) and was paused for this report. "
-        "The sweep stops by itself at a login wall or after 3 failed lookups in a row. A cheaper "
-        "alternative: about 400 random accounts would estimate country shares to within about 5 "
-        "percentage points.")
+          [(r, f"{n:,}", f"{w:,}") for r, n, w in by_reason], [9.6, 3.0, 3.0])
+    if complete:
+        p = doc.add_paragraph()
+        p.add_run("Full check (complete). ").bold = True
+        p.add_run(
+            f"The sweep checked every remaining on-topic author in a fixed random order ({sweep_done:,} accounts, "
+            "2026-10-14 to 2026-10-19). Threads limits 'About this profile': after about 925 lookups in a day, "
+            "lookups failed three in a row and only recovered after roughly 24 hours. The sweep therefore "
+            "kept to at most 800 lookups in any 24 hours, ran in batches of 100 with 25-minute breaks, and "
+            "never hit a login wall.")
+    else:
+        doc.add_paragraph(
+            "Only the random sample (and the sweep, below) can describe on-topic authors as a whole; the "
+            "prioritized and copy-cluster lookups were chosen on purpose and are not representative.")
+        p = doc.add_paragraph()
+        p.add_run("Full check (prepared, paused). ").bold = True
+        p.add_run(
+            f"A location-only mode now checks every unchecked on-topic author, {to_check:,} accounts, in a "
+            "fixed random order, so the accounts checked so far always form a random sample even if the sweep "
+            f"stops part-way. At about {per_lookup:.0f} seconds per account that is roughly {sweep_hours:.0f} "
+            f"hours of lookups; in safe batches of 100 with 25-minute breaks, about {batches} batches over "
+            f"{sweep_wall_h:.0f} hours ({sweep_wall_h / 24:.1f} days) with the laptop awake. A test batch ran "
+            f"cleanly ({sweep_done} lookups, all successful, no blocking) and was paused for this report. "
+            "The sweep stops by itself at a login wall or after 3 failed lookups in a row. A cheaper "
+            "alternative: about 400 random accounts would estimate country shares to within about 5 "
+            "percentage points.")
+    if complete and "cluster_random" in fig_paths:
+        figure(doc, fig_paths["cluster_random"], "Figure 4c. The earlier, smaller comparison (about 50 accounts "
+               "per group): copy-cluster members vs a random sample. The full results above confirm it.")
 
     doc.add_heading("Coordination signals", level=2)
     figure(doc, fig_paths["clusters"], "Figure 5. Copy-paste clusters: number of accounts posting the "
@@ -667,16 +779,23 @@ def main():
         "pairs are benign (news outlets share topical tags).")
 
     doc.add_heading("Account age", level=2)
-    figure(doc, fig_paths["joins"], "Figure 7. Threads join month of the location-checked accounts.")
+    figure(doc, fig_paths["joins"], "Figure 7. Threads join month of the location-checked accounts"
+           + (" (all on-topic authors)." if complete else "."))
     doc.add_paragraph(
-        f"{jul25} checked accounts joined Threads in July 2025, the month the fighting began "
-        f"({jul25_kh} of them based in Cambodia). Most were selected as copy-cluster members or by the "
-        f"earlier prioritized lookups; in the random group only {jul25_rand} of {n_rand} joined that month, "
-        "so this is a lead to follow up, not a population-wide result. "
+        (f"{sum(g['jul25'] for g in sig.values()):,} on-topic authors joined Threads in July 2025, the month "
+         f"the fighting began, {sig['Cambodia']['jul25']:,} of them based in Cambodia: "
+         f"{pct('Cambodia', 'jul25'):.0f}% of all Cambodia-based authors, "
+         f"against {pct('Thailand', 'jul25'):.1f}% of Thailand-based ones. Join months before and after are "
+         "much lower and there is no wave in December. A burst of new accounts at the start of a conflict fits "
+         "a mobilization campaign; it does not by itself show the accounts are fake, since genuine citizens "
+         "joining to take part would look the same. " if complete else
+         f"{jul25} checked accounts joined Threads in July 2025, the month the fighting began "
+         f"({jul25_kh} of them based in Cambodia). Most were selected as copy-cluster members or by the "
+         f"earlier prioritized lookups; in the random group only {jul25_rand} of {n_rand} joined that month, "
+         "so this is a lead to follow up, not a population-wide result. ") +
         f"{100 * jul23 / n_join:.0f}% of checked accounts joined in the July 2023 launch wave and "
         f"{100 * in_per_join / n_join:.0f}% joined during the study period. {100 * over100m / n_join:.0f}% "
-        "signed up after the first 100 million accounts and so have no signup number. Account age did not "
-        "separate copy-cluster members from random authors in a first check.")
+        "signed up after the first 100 million accounts and so have no signup number.")
 
     doc.add_heading("4. Limitations", level=1)
     bullets(doc, [
@@ -688,8 +807,11 @@ def main():
         ("English originals only. ", "Thai- and Khmer-language original posts were not searched; Thai-side "
          "campaigns are probably under-represented."),
         ("'Top' search favors popular posts. ", "Seed-outlet timelines reduce this bias but don't remove it."),
-        ("Location covers few accounts. ", f"{cov['All on-topic authors'][1]:,} of {n_on_acc:,} on-topic "
-         f"authors ({100 * cov['All on-topic authors'][1] / n_on_acc:.1f}%) were checked, and only "
+        ("Location is login-only and rate-limited. " if complete else "Location covers few accounts. ",
+         "Every on-topic author was checked, but Threads allows only about 900 'About this profile' lookups a "
+         "day per account, so checking new accounts in future collections is slow." if complete else
+         f"{cov['All on-topic authors'][1]:,} of {n_on_acc:,} on-topic authors "
+         f"({100 * cov['All on-topic authors'][1] / n_on_acc:.1f}%) were checked, and only "
          f"{100 * cov['Replied to an on-topic post'][2] / cov['Replied to an on-topic post'][0]:.1f}% of "
          "repliers have a country; a full check is prepared (section 3)."),
         ("Throttling. ", "Reply loading was throttled after searches; searches and reply pages now run in "
@@ -721,10 +843,10 @@ def main():
         ("Scope: ", "add Thai and Khmer original posts? The multilingual hashtag campaigns suggest the main "
          "activity is not English-only."),
         ("Data source: ", "continue scraping, or move to Meta Content Library if approved?"),
-        ("Country for every account? ", f"Run the full location check ({to_check:,} accounts, about "
-         f"{sweep_wall_h / 24:.1f} days, some risk to the research account), or settle for a random sample "
-         "of about 400 (within about 5 points)? This decides whether country can be a per-account "
-         "feature for the classifiers."),
+        *([] if complete else [("Country for every account? ", f"Run the full location check ({to_check:,} "
+         f"accounts, about {sweep_wall_h / 24:.1f} days, some risk to the research account), or settle for a "
+         "random sample of about 400 (within about 5 points)? This decides whether country can be a "
+         "per-account feature for the classifiers.")]),
         ("Study period: ", "extend into 2026 (the ceasefire and maritime-talk phase) to add a 'long after' "
          "phase for drift?"),
     ])

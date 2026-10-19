@@ -65,6 +65,12 @@ Resolved: the location lookup clicked the sidebar's "More" button instead of the
 ## Location sweep (2026-10-14 onwards)
 `scripts/sweep.sh` (run under `systemd-inhibit`) checks every unchecked on-topic author in a fixed random order (`lookup_reason = 'sweep'`), 100 per batch with 25-min breaks. **Threads rate-limits "About this profile":** about 925 lookups ran cleanly (2026-10-14 15:20 to 00:00), then failures came three in a row; after a 2 h rest only 7 more worked; after 24 h the same failed account (samnang_ch) opened fine ("Based in Cambodia"). So it looks like a rolling daily quota of roughly 900–950. The sweep now keeps at most `THREADS_DAILY_LOOKUPS` (default 800) lookups per rolling 24 h. Failed (`ui_error`) sweep lookups are reset to unchecked so they get retried. `scripts/sweep_resume.sh` does one test lookup before resuming after a stop.
 
+## Final numbers after the location sweep (2026-10-19) — supersede the 2026-10-13 numbers below
+The sweep finished 2026-10-19 08:42: **every on-topic author was location-checked** (3,963; 95.6% show a country). Each lookup also saves the profile's visible posts, so the database grew (73k posts, 14k accounts) and on-topic posts in the study period rose to **10,574 from 3,963 accounts** (4,315 keyword-matched + 6,259 thread replies). Cross-account copy clusters: 286 (186 on-topic), up to 42 accounts; 73 campaign hashtags.
+- Countries of all on-topic authors: Cambodia 1,432 (36%), Thailand 1,367 (34%), United States 275 (7%), no country 174 (4%), Malaysia 114 (3%).
+- Cambodia- vs Thailand-based authors (Fisher exact): in a copy-paste cluster 30.1% vs 1.8% (OR 24.1, p 3e-108); uses campaign hashtags 49.6% vs 13.3% (OR 6.4, p 1e-98); shares rare hashtags 29.9% vs 18.7% (OR 1.9, p 6e-12); **joined Threads in July 2025 17.9% vs 3.4% (OR 6.3, p 3e-38)**, with no wave in December. Profiles of all authors were opened during the sweep, so these are measured the same way for everyone.
+- Per-day rates: July 2025 148.4, December 87.9, before 2.9.
+
 ## Verified numbers (2026-10-13, after all reply pages were opened)
 Use these; older figures elsewhere in chat history are superseded.
 - Study period on-topic: **9,211 posts from 3,905 accounts** = **2,952 keyword-matched + 6,259 thread replies** (after adding the plural "Peace Accords" terms; before that 9,208 = 2,949 + 6,259). 6,281 is the *all-dates* thread-reply count, not the study-period one.
