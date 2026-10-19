@@ -27,6 +27,7 @@ check the schema.
 """
 import argparse
 import asyncio
+from collections import Counter
 import hashlib
 import calendar
 import json
@@ -772,6 +773,39 @@ def pick_sweep(st: "Store", topic: dict, n: int):
     return picks
 
 
+def pick_sweep_extended(st: "Store", topic: dict, n: int):
+    """After the on-topic sweep: the next n unchecked accounts of ANY kind, most useful first.
+    Tiers: 0 = on-topic authors in the study period (new ones keep appearing from profile
+    posts), 1 = on-topic authors at any date (relevant if the period is extended),
+    2 = accounts seen in topic searches or on reply pages (parents, quoted, failed-rule
+    replies), 3 = everyone else. Fixed pseudo-random order within a tier. Tier 0 is marked
+    'sweep' (same population as the main sweep); the rest 'sweep_ext'."""
+    since, until = topic["period_ts"] or (0, 2**62)
+    rows = st.db.execute(
+        """SELECT u.username,
+                  CASE WHEN EXISTS (SELECT 1 FROM posts p JOIN post_topics t ON t.post_pk = p.pk
+                                    AND t.topic = ? AND t.on_topic = 1
+                                    WHERE p.user_pk = u.pk AND p.taken_at BETWEEN ? AND ?) THEN 0
+                       WHEN EXISTS (SELECT 1 FROM posts p JOIN post_topics t ON t.post_pk = p.pk
+                                    AND t.topic = ? AND t.on_topic = 1 WHERE p.user_pk = u.pk) THEN 1
+                       WHEN EXISTS (SELECT 1 FROM posts p WHERE p.user_pk = u.pk
+                                    AND (p.source LIKE 'search%' OR p.source LIKE 'post:%')) THEN 2
+                       ELSE 3 END AS tier
+           FROM users u
+           WHERE u.country_checked_at IS NULL AND u.username IS NOT NULL
+             AND u.username NOT IN (SELECT value FROM json_each(?))""",
+        (topic["name"], since, until, topic["name"], json.dumps(topic["exclude_users"]))).fetchall()
+    key = lambda r: (r[1], hashlib.sha256(f"{topic['name']}:{r[0]}".encode()).hexdigest())  # noqa: E731
+    picks = sorted(rows, key=key)[:n]
+    st.db.executemany("UPDATE users SET lookup_reason = ? WHERE username = ?",
+                      [("sweep" if tier == 0 else "sweep_ext", u) for u, tier in picks])
+    st.commit()
+    tiers = Counter(t for _, t in rows)
+    print(f"location sweep: {len(picks)} this batch, {len(rows) - len(picks)} left after it "
+          f"(unchecked by tier 0-3: {[tiers.get(i, 0) for i in range(4)]})")
+    return [u for u, _ in picks]
+
+
 def pick_lookups(st: "Store", topic: dict, run_id: str, n: int):
     """Choose up to n users for location lookups: half copy-cluster members, half a random
     sample of other on-topic authors (seeded with run_id). Records users.lookup_reason."""
@@ -935,7 +969,7 @@ async def snowball(col: Collector, topic: dict, a):
         # lookup_reason records which half each user came from; the random draw is seeded
         # with the run id so it can be reproduced.
         if a.only_locations:
-            todo = pick_sweep(st, topic, a.max_locations)
+            todo = (pick_sweep_extended if a.sweep_all else pick_sweep)(st, topic, a.max_locations)
         else:
             picks = pick_lookups(st, topic, col.run_id, a.max_locations)
             n_cluster = sum(why == "cluster" for _, why in picks)
@@ -981,6 +1015,9 @@ def build_args():
     p.add_argument("--only-locations", action="store_true",
                    help="only look up countries of unchecked on-topic authors, in a fixed random "
                         "order (a sweep; batch size = --max-locations)")
+    p.add_argument("--sweep-all", action="store_true",
+                   help="with --only-locations: sweep ALL unchecked accounts, most useful first "
+                        "(on-topic in period, on-topic any date, seen in topic pages, rest)")
     p.add_argument("--max-profiles", type=int, default=30)
     p.add_argument("--max-locations", type=int, default=50)
     p.add_argument("--revisit-days", type=int, default=14, help="re-open post pages of on-topic posts up to this old")

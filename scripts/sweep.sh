@@ -4,6 +4,7 @@
 # Stops when nothing is left, on a login wall (exit 2), on repeated page failures (exit 3),
 # or when a batch stops early after 3 failed lookups in a row (possible blocking).
 # Keeps lookups in any rolling 24 h under THREADS_DAILY_LOOKUPS (default 800).
+# THREADS_SWEEP_ALL=1 sweeps every unchecked account (most useful first), not only on-topic authors.
 # Run it under a sleep blocker, e.g.:
 #   systemd-run --user --unit=threads-sweep systemd-inhibit --what=idle:sleep scripts/sweep.sh
 set -uo pipefail
@@ -29,7 +30,7 @@ while true; do
   LOG="logs/$(date +%F).log"
   OUT=$(mktemp)
   echo "=== $(date -Is) sweep batch $n ($BATCH lookups)" | tee -a "$LOG"
-  "$PY" -u threads_collector.py snowball "$TOPIC" --only-locations --max-locations "$BATCH" 2>&1 | tee "$OUT" >> "$LOG"
+  "$PY" -u threads_collector.py snowball "$TOPIC" --only-locations --max-locations "$BATCH" ${THREADS_SWEEP_ALL:+--sweep-all} 2>&1 | tee "$OUT" >> "$LOG"
   code=${PIPESTATUS[0]}
   echo "=== $(date -Is) sweep batch $n exit $code" | tee -a "$LOG"
   if [ "$code" -ne 0 ]; then echo "### sweep stopped: exit $code" | tee -a "$LOG"; rm -f "$OUT"; exit "$code"; fi
