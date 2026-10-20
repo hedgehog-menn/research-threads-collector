@@ -31,6 +31,7 @@ from collections import Counter
 import hashlib
 import calendar
 import json
+import os
 import random
 import re
 import sqlite3
@@ -779,7 +780,9 @@ def pick_sweep_extended(st: "Store", topic: dict, n: int):
     posts), 1 = on-topic authors at any date (relevant if the period is extended),
     2 = accounts seen in topic searches or on reply pages (parents, quoted, failed-rule
     replies), 3 = everyone else. Fixed pseudo-random order within a tier. Tier 0 is marked
-    'sweep' (same population as the main sweep); the rest 'sweep_ext'."""
+    'sweep' (same population as the main sweep); the rest 'sweep_ext'.
+    Tier 3 is skipped unless THREADS_SWEEP_TIER3=1: each lookup saves the profile's posts,
+    which bring in new unrelated accounts, so tier 3 grows about as fast as it is checked."""
     since, until = topic["period_ts"] or (0, 2**62)
     rows = st.db.execute(
         """SELECT u.username,
@@ -793,8 +796,13 @@ def pick_sweep_extended(st: "Store", topic: dict, n: int):
                        ELSE 3 END AS tier
            FROM users u
            WHERE u.country_checked_at IS NULL AND u.username IS NOT NULL
+             AND (? OR EXISTS (SELECT 1 FROM posts p WHERE p.user_pk = u.pk
+                               AND (p.source LIKE 'search%' OR p.source LIKE 'post:%'
+                                    OR p.pk IN (SELECT post_pk FROM post_topics
+                                                WHERE topic = ? AND on_topic = 1))))
              AND u.username NOT IN (SELECT value FROM json_each(?))""",
-        (topic["name"], since, until, topic["name"], json.dumps(topic["exclude_users"]))).fetchall()
+        (topic["name"], since, until, topic["name"], int(os.environ.get("THREADS_SWEEP_TIER3") == "1"),
+         topic["name"], json.dumps(topic["exclude_users"]))).fetchall()
     key = lambda r: (r[1], hashlib.sha256(f"{topic['name']}:{r[0]}".encode()).hexdigest())  # noqa: E731
     picks = sorted(rows, key=key)[:n]
     st.db.executemany("UPDATE users SET lookup_reason = ? WHERE username = ?",

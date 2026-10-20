@@ -48,7 +48,7 @@ Global options go **before** the command, as in `python threads_collector.py --h
 - `--dump-raw raw/` saves every raw payload so you can inspect the data format.
 - `snowball --only-posts` opens only reply pages (no searches, seed profiles, replier profiles or location lookups), to work through unopened reply pages.
 - `snowball --only-locations --max-locations 100` runs a location **sweep** batch: the next 100 unchecked on-topic authors in a fixed random order (`lookup_reason = sweep`), so a sweep stopped part-way is still a random sample.
-- `snowball --only-locations --sweep-all` (or `THREADS_SWEEP_ALL=1 scripts/sweep.sh`) extends the sweep to every unchecked account, most useful first: on-topic authors in the period, on-topic at any date, accounts seen in topic searches or reply pages, then the rest (`lookup_reason = sweep_ext`).
+- `snowball --only-locations --sweep-all` (or `THREADS_SWEEP_ALL=1 scripts/sweep.sh`) extends the sweep to every unchecked account, most useful first: on-topic authors in the period, on-topic at any date, accounts seen in topic searches or reply pages, then the rest (`lookup_reason = sweep_ext`). "The rest" (accounts only seen on profiles opened during lookups) is skipped unless `THREADS_SWEEP_TIER3=1`, because each lookup saves profile posts that bring in new unrelated accounts, so that group grows as fast as it is checked.
 - `--db`, `--auth` use a different database or session file.
 
 `+N new posts` counts only posts that weren't already in the database. Posts you've already collected still get fresh counts and a new snapshot.
