@@ -351,6 +351,18 @@ def main():
 
     # ---- whole-population location results (meaningful once the sweep is complete)
     complete = to_check == 0
+    # extended sweep: accounts beyond the on-topic authors (sweep_ext)
+    ext_n, ext_c = q("""SELECT COUNT(*), COALESCE(SUM(country IS NOT NULL), 0) FROM users
+                        WHERE lookup_reason = 'sweep_ext' AND country_checked_at IS NOT NULL""")[0]
+    ext_countries = q("""SELECT country, COUNT(*) FROM users WHERE lookup_reason = 'sweep_ext'
+                         AND country IS NOT NULL GROUP BY 1 ORDER BY 2 DESC LIMIT 6""")
+    related_left = one(f"""SELECT COUNT(*) FROM users u WHERE u.country_checked_at IS NULL
+        AND u.username NOT IN (SELECT value FROM json_each(?))
+        AND EXISTS (SELECT 1 FROM posts p WHERE p.user_pk = u.pk AND (p.source LIKE 'search%'
+                    OR p.source LIKE 'post:%' OR p.pk IN (SELECT post_pk FROM post_topics
+                    WHERE topic = '{name}' AND on_topic = 1)))""", json.dumps(topic.get("exclude_users", [])))
+    all_checked = one("SELECT COUNT(*) FROM users WHERE country_checked_at IS NOT NULL")
+    all_with_c = one("SELECT COUNT(*) FROM users WHERE country IS NOT NULL")
     AUTH = f"SELECT DISTINCT p.user_pk FROM posts p {ON} WHERE {PER}"
     pop_countries = q(f"""SELECT COALESCE(u.country, '(no country)'), COUNT(*) FROM users u
                           WHERE u.pk IN ({AUTH}) GROUP BY 1 ORDER BY 2 DESC""")
@@ -757,6 +769,19 @@ def main():
     if complete and "cluster_random" in fig_paths:
         figure(doc, fig_paths["cluster_random"], "Figure 4c. The earlier, smaller comparison (about 50 accounts "
                "per group): copy-cluster members vs a random sample. The full results above confirm it.")
+    if ext_n:
+        p = doc.add_paragraph()
+        p.add_run("Beyond the on-topic authors (in progress). ").bold = True
+        p.add_run(
+            f"A second sweep is checking the other topic-related accounts: authors of parent and quoted "
+            f"posts, repliers whose posts failed the keyword rule, and on-topic authors outside the study "
+            f"period. So far {ext_n:,} have been checked ({100 * ext_c / ext_n:.0f}% show a country; these "
+            f"peripheral accounts more often lack one) and about {related_left:,} remain. Their countries: "
+            + ", ".join(f"{c} {n:,}" for c, n in ext_countries) + ". "
+            f"Across the whole database, {all_checked:,} accounts are now checked and {all_with_c:,} have a "
+            "country. Accounts seen only on profiles opened during lookups are not checked, because every "
+            "lookup brings in new ones of those. These extra countries are mainly context for parent and "
+            "quoted posts; the on-topic results above do not depend on them.")
 
     doc.add_heading("Coordination signals", level=2)
     figure(doc, fig_paths["clusters"], "Figure 5. Copy-paste clusters: number of accounts posting the "
