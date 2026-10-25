@@ -99,9 +99,10 @@ def main():
                CASE WHEN u.country_checked_at IS NULL THEN 'not_checked'
                     WHEN u.country IS NOT NULL THEN 'country'
                     WHEN u.country_raw LIKE '%Not shared%' THEN 'not_shared'
+                    WHEN u.country_raw = 'account_gone' THEN 'account_gone'
                     WHEN u.country_raw LIKE 'ui_error%' THEN 'lookup_failed'
                     ELSE 'no_based_in_row' END AS country_status,
-               u.lookup_reason,
+               u.lookup_reason, datetime(u.gone_at,'unixepoch') AS gone_utc,
                f.joined_month, f.account_age_months, f.signup_number, f.signup_over_100m,
                f.joined_in_period, f.months_join_to_next_peak,
                m.n_on_topic_posts, m.n_on_topic_replies, f.n_posts AS n_posts_collected,

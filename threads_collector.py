@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS users (
     country_raw TEXT,
     country_checked_at INTEGER,
     lookup_reason TEXT,  -- why the location lookup chose this user: cluster / random
+    gone_at INTEGER,     -- when a lookup found the account removed ("the page is gone")
     first_seen INTEGER,
     last_seen INTEGER
 );
@@ -158,7 +159,7 @@ POST_MIGRATIONS = {
     "self_thread_pos": "INTEGER", "self_thread_length": "INTEGER", "is_edited": "INTEGER",
     "ai_label": "TEXT", "last_scraped_at": "INTEGER", "found_as": "TEXT",
 }
-USER_MIGRATIONS = {"lookup_reason": "TEXT"}
+USER_MIGRATIONS = {"lookup_reason": "TEXT", "gone_at": "INTEGER"}
 TOPIC_MIGRATIONS = {"match": "TEXT"}
 VISIT_MIGRATIONS = {"n_responses": "INTEGER", "reached_end": "INTEGER"}
 
@@ -658,6 +659,18 @@ class Collector:
         if "/login" in self.page.url:
             self.store.log_visit(self.run_id, "location", username, started, 0, 0, "login_wall")
             raise LoginWall(username)
+        # Removed (deleted or suspended) accounts show "the page is gone" and have no menu.
+        # Record that - it is a weak-label candidate - and don't count it as a failure.
+        body = await self.page.evaluate("document.body.innerText")
+        if "the page is gone" in body or "link's not working" in body:
+            self.store.db.execute(
+                "UPDATE users SET country_checked_at = ?, "
+                "country_raw = CASE WHEN country IS NULL THEN 'account_gone' ELSE country_raw END, "
+                "gone_at = ? WHERE username = ?", (now(), now(), username))
+            self.store.commit()
+            print(f"[location] @{username}: account gone (removed or suspended)")
+            self.store.log_visit(self.run_id, "location", username, started, 0, 0, "gone")
+            return True
         # the profile page is loaded anyway: keep its header (bio, followers) and posts
         self.source = f"location:{username}"
         await self._ingest_inline()

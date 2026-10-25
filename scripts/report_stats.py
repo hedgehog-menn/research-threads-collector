@@ -95,9 +95,10 @@ def main():
         has_c = sum(1 for c, _ in rows if c)
         hidden = sum(1 for c, r in rows if not c and r and "Not shared" in r)
         err = sum(1 for c, r in rows if not c and r and r.startswith("ui_error"))
-        no_row = n - has_c - hidden - err
+        gone = sum(1 for c, r in rows if not c and r == "account_gone")
+        no_row = n - has_c - hidden - err - gone
         print(f"{label}: checked {n}; country {pct(has_c, n)}; 'Not shared' {pct(hidden, n)}; "
-              f"no Based-in row {pct(no_row, n)}; ui_error {pct(err, n)}")
+              f"no Based-in row {pct(no_row, n)}; ui_error {pct(err, n)}; account gone {pct(gone, n)}")
     loc("", "all checked users")
     loc(f"AND u.pk IN (SELECT p.user_pk FROM posts p {ON})", "on-topic authors")
     has_reason = any(c[1] == "lookup_reason" for c in q("PRAGMA table_info(users)"))
