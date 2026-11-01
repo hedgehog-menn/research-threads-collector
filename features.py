@@ -302,18 +302,20 @@ def text_clusters(posts):
     for i, g in enumerate(grams):
         for sh in g:
             index.setdefault(sh, []).append(i)
-    shared = Counter()
-    for ids in index.values():
-        if 1 < len(ids) <= MAX_SHINGLE_DF:
-            for a in range(len(ids)):
-                for b in range(a + 1, len(ids)):
-                    shared[(ids[a], ids[b])] += 1
-    for (i, j), n in shared.items():
-        if min(len(norm[i][2]), len(norm[j][2])) < NEAR_MIN_CHARS:
+    # count shared rare n-grams one post at a time (pairs j > i): a global pair counter
+    # ran out of memory at 160k posts; the components found are the same
+    for i, g in enumerate(grams):
+        if len(norm[i][2]) < NEAR_MIN_CHARS:
             continue
-        if n >= MIN_SHARED and find(i) != find(j):
-            if len(grams[i] & grams[j]) / len(grams[i] | grams[j]) >= DUP_JACCARD:
-                parent[find(i)] = find(j)
+        shared = Counter()
+        for sh in g:
+            ids = index[sh]
+            if 1 < len(ids) <= MAX_SHINGLE_DF:
+                shared.update(j for j in ids if j > i)
+        for j, n in shared.items():
+            if n >= MIN_SHARED and len(norm[j][2]) >= NEAR_MIN_CHARS and find(i) != find(j):
+                if len(g & grams[j]) / len(g | grams[j]) >= DUP_JACCARD:
+                    parent[find(i)] = find(j)
 
     groups: dict[int, list[int]] = {}
     for i in range(len(norm)):

@@ -772,12 +772,15 @@ def main():
                "per group): copy-cluster members vs a random sample. The full results above confirm it.")
     if ext_n:
         p = doc.add_paragraph()
-        p.add_run("Beyond the on-topic authors (in progress). ").bold = True
+        ext_done = not related_left
+        p.add_run("Beyond the on-topic authors" + ("" if ext_done else " (in progress)") + ". ").bold = True
         p.add_run(
-            f"A second sweep is checking the other topic-related accounts: authors of parent and quoted "
+            ("A second sweep checked all " if ext_done else "A second sweep is checking the ")
+            + "other topic-related accounts: authors of parent and quoted "
             f"posts, repliers whose posts failed the keyword rule, and on-topic authors outside the study "
-            f"period. So far {ext_n:,} have been checked ({100 * ext_c / ext_n:.0f}% show a country; these "
-            f"peripheral accounts more often lack one) and about {related_left:,} remain. Their countries: "
+            f"period. {'In total' if ext_done else 'So far'} {ext_n:,} have been checked "
+            f"({100 * ext_c / ext_n:.0f}% show a country; these peripheral accounts more often lack one)"
+            + ("" if ext_done else f" and about {related_left:,} remain") + ". Their countries: "
             + ", ".join(f"{c} {n:,}" for c, n in ext_countries) + ". "
             f"Across the whole database, {all_checked:,} accounts are now checked and {all_with_c:,} have a "
             "country. Accounts seen only on profiles opened during lookups are not checked, because every "
