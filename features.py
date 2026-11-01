@@ -37,7 +37,7 @@ from pathlib import Path
 import hanzidentifier as hz
 from lingua import LanguageDetectorBuilder
 
-FEATURES_VERSION = "7"
+FEATURES_VERSION = "8"
 
 MIN_LATIN_LETTERS = 12  # below this, Latin-script language detection is guesswork
 MIN_TZ_POSTS = 20       # posts needed to fit an active-hours offset
@@ -277,9 +277,12 @@ def normalize_for_dup(text: str) -> str:
     return "".join(ch for ch in t if ch.isalnum())
 
 
-def text_clusters(posts):
-    """posts: [(pk, username, text, taken_at)] -> list of clusters of 2+ posts whose
-    normalized texts are identical or overlap >= DUP_JACCARD (character n-grams)."""
+def text_clusters(posts, name_of=None):
+    """posts: [(pk, user_pk, text, taken_at)] -> list of clusters of 2+ posts whose
+    normalized texts are identical or overlap >= DUP_JACCARD (character n-grams).
+    Accounts are counted by user_pk (several deactivated accounts share the display name
+    "Instagram user"); name_of maps user_pk -> username for the usernames column."""
+    name_of = name_of or {}
     norm = [(pk, u, normalize_for_dup(t), ts) for pk, u, t, ts in posts]
     norm = [x for x in norm if len(x[2]) >= MIN_DUP_CHARS]
     grams = [{n[i:i + SHINGLE] for i in range(len(n) - SHINGLE + 1)} for _, _, n, _ in norm]
@@ -329,11 +332,13 @@ def text_clusters(posts):
         pks = sorted(r[0] for r in rows)
         times = [r[3] for r in rows if r[3]]
         users = sorted({r[1] for r in rows})
+        names = sorted({name_of.get(u, u) for u in users})
         first = min(rows, key=lambda r: r[3] or 0)
         gaps = [b - a for a, b in zip(sorted(times), sorted(times)[1:])]
         clusters.append({
             "cluster_id": pks[0], "post_pks": pks, "n_posts": len(rows),
-            "n_accounts": len(users), "usernames": json.dumps(users, ensure_ascii=False),
+            "n_accounts": len(users), "user_pks": json.dumps(users),
+            "usernames": json.dumps(names, ensure_ascii=False),
             "exact": int(len({r[2] for r in rows}) == 1),
             "first_at": min(times) if times else None, "last_at": max(times) if times else None,
             "span_hours": round((max(times) - min(times)) / 3600, 2) if times else None,
@@ -471,7 +476,7 @@ USER_COLS = ["user_pk", "username", "country", "n_posts", "top_lang", "top_lang_
 #                    joined_month / account_age_months / signup_number,
 #                    months_join_to_next_peak / joined_in_period (need --topic)
 #   descriptive:     lang, simp_share, tz_offset, n_posts
-CLUSTER_COLS = ["cluster_id", "n_posts", "n_accounts", "usernames", "exact", "first_at",
+CLUSTER_COLS = ["cluster_id", "n_posts", "n_accounts", "user_pks", "usernames", "exact", "first_at",
                 "last_at", "span_hours", "min_gap_s", "median_gap_s", "min_signup_gap",
                 "n_with_signup", "first_post_pk", "sample_text",
                 "features_version", "computed_at"]
@@ -495,18 +500,19 @@ def build(db: sqlite3.Connection, topic: dict | None = None):
     for (pk, upk, _, ts, _), f in zip(posts, post_rows):
         by_user.setdefault(upk, []).append((ts, f))
 
-    clusters = text_clusters([(pk, u, t, ts) for pk, _, t, ts, u in posts])
+    name_of = {upk: u for _, upk, _, _, u in posts}
+    clusters = text_clusters([(pk, upk, t, ts) for pk, upk, t, ts, _ in posts], name_of)
     text_of = {pk: t for pk, _, t, _, _ in posts}
-    user_of = {pk: u for pk, _, _, _, u in posts}
+    user_of = {pk: upk for pk, upk, _, _, _ in posts}
     copy_posts, partners = Counter(), {}
     time_of = {pk: ts for pk, _, _, ts, _ in posts}
     # batch-created accounts get adjacent signup numbers; only the first 100M have one
-    signup_of = {u: n for u, raw in db.execute("SELECT username, country_raw FROM users")
+    signup_of = {upk: n for upk, raw in db.execute("SELECT pk, country_raw FROM users")
                  if (n := signup_number(raw)[0]) is not None}
     fastest: dict[str, int] = {}
     signup_gap: dict[str, int] = {}
     for c in clusters:
-        nums = sorted(signup_of[u] for u in json.loads(c["usernames"]) if u in signup_of)
+        nums = sorted(signup_of[u] for u in json.loads(c["user_pks"]) if u in signup_of)
         c["n_with_signup"] = len(nums)
         c["min_signup_gap"] = min((b - a for a, b in zip(nums, nums[1:])), default=None)
         c.update(sample_text=(text_of[c["first_post_pk"]] or "")[:300],
@@ -520,7 +526,7 @@ def build(db: sqlite3.Connection, topic: dict | None = None):
             if others:
                 gap = min(abs(t - o) for o in others)
                 fastest[u] = min(gap, fastest.get(u, gap))
-        users = json.loads(c["usernames"])
+        users = json.loads(c["user_pks"])
         for u in users:
             partners.setdefault(u, set()).update(x for x in users if x != u)
             if u in signup_of:
@@ -567,10 +573,10 @@ def build(db: sqlite3.Connection, topic: dict | None = None):
                 if exp and tz is not None and tzm >= MIN_TZ_MARGIN else None),
             "flag_simplified_in_taiwan": (
                 int(simp_share > 0.5) if country == "Taiwan" and simp_share is not None else None),
-            "n_copy_posts": copy_posts.get(username, 0),
-            "n_copy_partners": len(partners.get(username, ())),
-            "fastest_copy_gap_s": fastest.get(username),
-            "min_signup_gap_to_partner": signup_gap.get(username),
+            "n_copy_posts": copy_posts.get(upk, 0),
+            "n_copy_partners": len(partners.get(upk, ())),
+            "fastest_copy_gap_s": fastest.get(upk),
+            "min_signup_gap_to_partner": signup_gap.get(upk),
             "n_hashtags": tag_user.get(upk, {}).get("n_hashtags", 0),
             "n_campaign_tags": tag_user.get(upk, {}).get("n_campaign_tags", 0),
             "n_rare_tag_partners": tag_user.get(upk, {}).get("n_rare_tag_partners", 0),

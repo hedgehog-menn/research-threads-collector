@@ -853,10 +853,10 @@ def pick_lookups(st: "Store", topic: dict, run_id: str, n: int):
     sample of other on-topic authors (seeded with run_id). Records users.lookup_reason."""
     from features import text_clusters  # lazy: keeps the collector light otherwise
     on_rows = st.db.execute(
-        """SELECT p.pk, p.username, p.text, p.taken_at FROM posts p JOIN post_topics t
+        """SELECT p.pk, p.user_pk, p.text, p.taken_at FROM posts p JOIN post_topics t
              ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1""", (topic["name"],)).fetchall()
-    in_clusters = {u for c in text_clusters(on_rows) if c["n_accounts"] >= 2
-                   for u in json.loads(c["usernames"])}
+    in_clusters = {pk for c in text_clusters(on_rows) if c["n_accounts"] >= 2
+                   for pk in json.loads(c["user_pks"])}
     candidates = st.db.execute(
         """SELECT p.username, u.pk, COUNT(*) FROM posts p JOIN post_topics t
              ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1
@@ -865,8 +865,8 @@ def pick_lookups(st: "Store", topic: dict, run_id: str, n: int):
              AND p.username NOT IN (SELECT value FROM json_each(?))
            GROUP BY u.pk ORDER BY p.username, u.pk""",
         (topic["name"], skip_names(topic))).fetchall()
-    clustered = sorted((r for r in candidates if r[0] in in_clusters), key=lambda r: -r[2])
-    others = [(u, pk) for u, pk, _ in candidates if u not in in_clusters]
+    clustered = sorted((r for r in candidates if r[1] in in_clusters), key=lambda r: -r[2])
+    others = [(u, pk) for u, pk, _ in candidates if pk not in in_clusters]
     n_cluster = min(len(clustered), n // 2)
     n_random = min(len(others), n - n_cluster)
     picks = [(u, pk, "cluster") for u, pk, _ in clustered[:n_cluster]]

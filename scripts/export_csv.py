@@ -118,7 +118,7 @@ def main():
         ORDER BY m.n_on_topic_posts DESC""", (name,)))
 
     write(a.out / "text_clusters.csv", db.execute("""
-        SELECT cluster_id, n_posts, n_accounts, usernames, exact,
+        SELECT cluster_id, n_posts, n_accounts, user_pks, usernames, exact,
                datetime(first_at,'unixepoch') AS first_utc, datetime(last_at,'unixepoch') AS last_utc,
                span_hours, min_gap_s, median_gap_s, min_signup_gap, n_with_signup, sample_text
         FROM text_clusters WHERE n_accounts >= 2 ORDER BY n_accounts DESC"""))

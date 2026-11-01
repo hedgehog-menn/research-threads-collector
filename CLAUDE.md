@@ -82,6 +82,8 @@ The sweep finished 2026-10-19 08:42: **every on-topic author was location-checke
 
 **Placeholder fix (2026-11-02):** user updates in the collector (`set_country`, removed-account marking, `lookup_reason`) are keyed on pk, and "Instagram user" (`PLACEHOLDER_USERNAMES`) is never looked up. The 15 placeholder rows wrongly marked `account_gone` on 2026-10-25 were reset to unchecked (removed accounts now 495). Summary findings use the adjusted ORs (copy 24.2 [15.9-36.9], campaign 6.5 [5.4-7.9]).
 
+**Follow-ups (2026-11-02, features v8):** topic-restricted rare-tag links (same rule, on-topic posts in the period only) were tried and dropped as too sparse: 27 pairs, 22 accounts (0.6%); Cambodia 0.8%, Thailand 0.4%, other 0.4% (p 0.34); mostly news outlets sharing generic topic tags. The report computes and states this. Copy-cluster features are keyed on user pk (`text_clusters.user_pks`); counts unchanged (343 clusters, 656 accounts). AI labels on on-topic posts: 10 SELF_DISCLOSURE_FLOW + 1 IPTC_METADATA_EDITED of 10,654 (125 NULL), so platform AI labels can't be ground truth (in Limitations).
+
 **Removed accounts (2026-10-25):** the extended sweep stopped on 3 "failures" in a row that were really removed accounts: profiles showing "the link's not working or the page is gone" (fast ~9 s fails, not throttle timeouts of ~30 s). `fetch_country` now detects that page, sets `users.country_raw = 'account_gone'` and `users.gone_at`, logs the visit as `gone`, and does not count it as a failure. Earlier `ui_error` lookups were reset to unchecked for a retry. Accounts that disappear after collection are a weak-label candidate (raise with KT).
 
 ## Verified numbers (2026-10-13, after all reply pages were opened)

@@ -235,7 +235,7 @@ ACCOUNT_COLUMNS = [
     ("first_seen_utc, country_checked_utc", "When the account was first collected and when its location was checked."),
 ]
 OTHER_FILES = [
-    ("text_clusters.csv", "One row per copy-paste cluster spanning 2+ accounts: n_posts, n_accounts, usernames, exact (1 = identical after normalization), first/last copy time, span_hours, min_gap_s, median_gap_s, min_signup_gap, sample_text."),
+    ("text_clusters.csv", "One row per copy-paste cluster spanning 2+ accounts (accounts counted by user ID): n_posts, n_accounts, user_pks, usernames, exact (1 = identical after normalization), first/last copy time, span_hours, min_gap_s, median_gap_s, min_signup_gap, sample_text."),
     ("hashtags.csv", "One row per hashtag: n_accounts, n_posts, is_campaign (20+ accounts), first/last use."),
     ("hashtag_pairs.csv", "Account pairs linked by rare hashtags: user_a_pk, user_b_pk, user_a, user_b, n_shared (shared rare tags), posts_a / posts_b (separate posts carrying them, copies and quotes of each other excluded; 2+ each), n_days, shared_tags."),
 ]
@@ -314,7 +314,7 @@ def main():
     max_acc = max((c[0] for c in multi), default=0)
     under60 = sum(1 for c in multi if c[1] is not None and c[1] < 60)
     # hashtag chart and table: on-topic posts in the study period (the hashtags table covers all posts)
-    from features import CAMPAIGN_MIN_ACCOUNTS, hashtags_of
+    from features import CAMPAIGN_MIN_ACCOUNTS, hashtag_features, hashtags_of
     tag_users, tag_posts = {}, Counter()
     for u, text in q(f"SELECT p.username, p.text FROM posts p {ON} WHERE {PER}"):
         for tg in hashtags_of(text):
@@ -410,6 +410,21 @@ def main():
         JOIN post_features f ON f.post_pk = p.pk
         WHERE p.source LIKE 'search%' AND p.user_pk NOT IN (SELECT user_pk FROM onp)""")[0]
     ai = Counter(dict(q(f"SELECT COALESCE(p.ai_label,'(missing)'), COUNT(*) FROM posts p {ON} WHERE {PER} GROUP BY 1")))
+    # rare-tag links restricted to on-topic posts (tried as a feature; dropped as too sparse)
+    _, topic_pairs, topic_tag_user = hashtag_features(
+        q(f"SELECT p.pk, p.user_pk, p.username, p.text, p.taken_at FROM posts p {ON} WHERE {PER}"),
+        dict(q("SELECT post_pk, cluster_id FROM post_text_clusters")),
+        dict(q("SELECT pk, quoted_post_pk FROM posts WHERE quoted_post_pk IS NOT NULL")))
+    topic_linked = {u for u, d in topic_tag_user.items() if d["n_rare_tag_partners"]}
+    topic_rare = Counter()  # group -> (linked, n)
+    for upk, c in q(f"SELECT u.pk, u.country FROM users u WHERE u.pk IN (SELECT DISTINCT p.user_pk FROM posts p {ON} WHERE {PER})"):
+        g = c if c in ("Cambodia", "Thailand") else "Other / none"
+        topic_rare[g, "n"] += 1
+        topic_rare[g, "linked"] += upk in topic_linked
+    topic_rare_p = fisher_two_sided(topic_rare["Cambodia", "linked"],
+                                    topic_rare["Cambodia", "n"] - topic_rare["Cambodia", "linked"],
+                                    topic_rare["Thailand", "linked"],
+                                    topic_rare["Thailand", "n"] - topic_rare["Thailand", "linked"])
     seeds = topic["seeds"]
 
     # ---- whole-population location results (meaningful once the sweep is complete)
@@ -960,8 +975,15 @@ def main():
         "The strongest links are shared interests (football, Formula 1, food videos, follow-for-follow tags), "
         "not the conflict: 'rare' means rare in this collection, which holds only about a page of each "
         "profile, not rare on Threads. Shared rare tags show common interests or a common source as well as "
-        "coordination; check a pair's posts before reading it as coordination. Restricting the links to "
-        "topic-related tags or on-topic posts would be a stronger coordination feature.")
+        "coordination; check a pair's posts before reading it as coordination.")
+    tr = lambda g: 100 * topic_rare[g, "linked"] / topic_rare[g, "n"] if topic_rare[g, "n"] else 0  # noqa: E731
+    doc.add_paragraph(
+        "A topic-restricted version (the same rule on on-topic posts of the study period only) was tried and "
+        f"dropped as too sparse: {len(topic_pairs)} pairs link {len(topic_linked)} accounts "
+        f"({100 * len(topic_linked) / n_on_acc:.1f}% of on-topic authors): Cambodia-based {tr('Cambodia'):.1f}%, "
+        f"Thailand-based {tr('Thailand'):.1f}%, other or none {tr('Other / none'):.1f}% (Fisher p = "
+        f"{topic_rare_p:.2f}). Most of these links join news outlets that share generic topic tags. Few "
+        "on-topic posts carry rare tags, and an account rarely uses them in two separate posts.")
 
     doc.add_heading("Account age", level=2)
     figure(doc, fig_paths["joins"], f"Figure 7. Threads join month of on-topic authors in the study period "
@@ -1020,7 +1042,10 @@ def main():
          "accounts posting on a clock far from Southeast Asia."),
         ("Throttling. ", "Reply loading was throttled after searches; searches and reply pages now run in "
          "separate sessions."),
-        ("AI labels are disclosures. ", f"ai_label = NONE ({ai.get('NONE', 0):,} on-topic posts) does not "
+        ("Platform AI labels can't serve as ground truth. ", f"Of {n_on:,} on-topic posts, "
+         + (", ".join(f"{n:,} {'carries' if n == 1 else 'carry'} {k}" for k, n in ai.most_common() if k not in ("NONE", "(missing)")) or "none carry an AI label")
+         + f"; {ai.get('NONE', 0):,} are NONE and {ai.get('(missing)', 0):,} have no label field. The label "
+         "records the poster's own disclosure or embedded file metadata, not detection, so NONE does not "
          "mean human-made."),
         ("No ground-truth labels yet. ", "Clusters and flags are candidate features, not labels."),
     ])
