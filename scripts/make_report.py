@@ -201,7 +201,9 @@ POST_COLUMNS = [
     ("reply_to_username", "For replies: the account being replied to."),
     ("root_post_username", "For replies: the author of the post that started the conversation."),
     ("thread_page_url", "For replies collected from a post page: that page's post (the reply's thread)."),
-    ("like_count, reply_count, repost_count, quote_count, reshare_count", "Engagement as shown by Threads when last collected. reply_count is Threads' total and can exceed the replies Threads actually displays."),
+    ("like_count, reply_count, repost_count, quote_count, reshare_count", "Engagement as shown by Threads when last collected (checked against the browser). Threads' repost icon "
+     "shows repost_count + quote_count; reshare_count is the share (send) icon. reply_count is Threads' total and "
+     "can exceed the replies Threads actually displays."),
     ("media_type", "text, image, video, carousel, or a raw Threads code."),
     ("link_url", "Outbound link, with the Threads redirect removed."),
     ("quoted_post_id", "post_id of the post this one quotes."),

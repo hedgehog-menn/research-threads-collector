@@ -115,7 +115,7 @@ Work in batches of about 100 and take breaks between them. Each lookup waits 4â€
 - **`users`**: `username`, `full_name`, `follower_count`, `bio`, `country`, `country_raw`, `country_checked_at`
 - **`posts`**: one row per post
   - `text`, `taken_at` (unix time), `url`, `username`, `user_pk`
-  - `like_count`, `reply_count`, `repost_count`, `quote_count`, `reshare_count`
+  - `like_count`, `reply_count`, `repost_count`, `quote_count`, `reshare_count`. The repost icon on Threads shows `repost_count + quote_count`; `reshare_count` is the share (send) icon. Checked against the browser on 2026-11-02.
   - `is_reply`, `reply_to_username`, `root_post_username` (who started the conversation)
   - `thread_root_pk`, `thread_pos`, plus `self_thread_pos` and `self_thread_length` for multi-post threads by one author
   - `topic_tag` (such as "Tech Threads"), `media_type` (`text`, `image`, `video`, `carousel`, or a raw number code), `link_url`, `quoted_post_pk`, `is_edited`
