@@ -12,6 +12,7 @@ queried from the database when the report is built.
 import argparse
 import datetime as dt
 import json
+import math
 import sqlite3
 import sys
 from collections import Counter
@@ -19,6 +20,7 @@ from math import comb
 from pathlib import Path
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -44,6 +46,7 @@ GLOSS = {
     "#ថៃជាអ្នកផ្តើមសង្គ្រាម": "Thailand started the war",
     "#ថៃបានឈ្លានពានកម្ពុជាដោយកម្លាំងយោធា": "Thailand invaded Cambodia by military force",
     "#ទាហ៊ានថៃបានបើកការវាយប្រហារលើកម្ពុជាមុន": "The Thai military attacked Cambodia first",
+    "#泰国军队首先对柬埔寨发动了攻击": "The Thai military attacked Cambodia first",
     "#កម្ពុជាមានសិទ្ធិក្នុងការការពារខ្លួននិងអធិបតេយ្យភាពជាតិរបស់ខ្លួន":
         "Cambodia has the right to defend itself and its sovereignty",
 }
@@ -75,6 +78,22 @@ def fisher_two_sided(a, b, c, d):
     p = lambda x: comb(c1, x) * comb(n - c1, r1 - x) / comb(n, r1)  # noqa: E731
     p0 = p(a)
     return sum(p(x) for x in range(max(0, r1 - (n - c1)), min(r1, c1) + 1) if p(x) <= p0 * (1 + 1e-9))
+
+
+def logit(X, y):
+    """Logistic regression by Newton-Raphson. Returns (OR, CI low, CI high, p) per column
+    after the intercept, with Wald 95% intervals."""
+    beta = np.zeros(X.shape[1])
+    for _ in range(100):
+        pr = 1 / (1 + np.exp(-X @ beta))
+        H = X.T @ (X * (pr * (1 - pr))[:, None])
+        step = np.linalg.solve(H, X.T @ (y - pr))
+        beta += step
+        if np.abs(step).max() < 1e-10:
+            break
+    se = np.sqrt(np.diag(np.linalg.inv(H)))
+    return [(math.exp(b), math.exp(b - 1.96 * e), math.exp(b + 1.96 * e),
+             math.erfc(abs(b / e) / math.sqrt(2))) for b, e in zip(beta[1:], se[1:])]
 
 
 def style_axes(ax, ygrid=True):
@@ -246,6 +265,10 @@ def main():
     n_on_acc = one(f"SELECT COUNT(DISTINCT p.user_pk) FROM posts p {ON} WHERE {PER}")
     n_kw = one(f"SELECT COUNT(*) FROM posts p {ON} WHERE {PER} AND COALESCE(t.match,'keywords') = 'keywords'")
     n_thread = n_on - n_kw
+    # originals are all keyword-matched; replies come from thread pages or match the keywords themselves
+    n_orig = one(f"SELECT COUNT(*) FROM posts p {ON} WHERE {PER} AND p.is_reply = 0")
+    n_reply = n_on - n_orig
+    n_kw_reply = n_kw - n_orig
     n_rounds = one("SELECT COUNT(DISTINCT run_id) FROM visits")
     first_run = one("SELECT date(MIN(started_at),'unixepoch') FROM visits")
     last_run = one("SELECT date(MAX(finished_at),'unixepoch') FROM visits")
@@ -265,7 +288,7 @@ def main():
         y, m = (y + 1, 1) if m == 12 else (y, m + 1)
     by_month = {mo: (k, th) for mo, k, th in q(f"""
         SELECT strftime('%Y-%m', p.taken_at, 'unixepoch'),
-               SUM(COALESCE(t.match,'keywords') = 'keywords'), SUM(t.match = 'thread')
+               SUM(p.is_reply = 0), SUM(p.is_reply = 1)
         FROM posts p {ON} WHERE {PER} GROUP BY 1""")}
     langs = Counter(dict(q(f"""SELECT f.lang, COUNT(*) FROM posts p {ON}
                               JOIN post_features f ON f.post_pk = p.pk
@@ -288,15 +311,45 @@ def main():
     n_multi_on = sum(c[2] in on_cluster_ids for c in multi)
     max_acc = max((c[0] for c in multi), default=0)
     under60 = sum(1 for c in multi if c[1] is not None and c[1] < 60)
-    top_tags = q("SELECT tag, n_accounts, n_posts FROM hashtags ORDER BY n_accounts DESC LIMIT 12")
+    # hashtag chart and table: on-topic posts in the study period (the hashtags table covers all posts)
+    from features import CAMPAIGN_MIN_ACCOUNTS, hashtags_of
+    tag_users, tag_posts = {}, Counter()
+    for u, text in q(f"SELECT p.username, p.text FROM posts p {ON} WHERE {PER}"):
+        for tg in hashtags_of(text):
+            tag_users.setdefault(tg, set()).add(u)
+            tag_posts[tg] += 1
+    top_tags = sorted(((tg, len(us), tag_posts[tg]) for tg, us in tag_users.items()),
+                      key=lambda r: (-r[1], r[0]))[:12]
+    n_campaign_on = sum(len(us) >= CAMPAIGN_MIN_ACCOUNTS for us in tag_users.values())
     n_campaign = one("SELECT COUNT(*) FROM hashtags WHERE is_campaign = 1")
     n_pairs = one("SELECT COUNT(*) FROM hashtag_pairs")
     top_pair = q("SELECT user_a, user_b, n_shared, shared_tags FROM hashtag_pairs ORDER BY n_shared DESC LIMIT 1")
-    joins = q("SELECT joined_month FROM user_features WHERE joined_month IS NOT NULL")
+    pair_posts = []  # per account of the top pair: posts carrying any shared tag, and their days
+    if top_pair:
+        shared_tags = set(json.loads(top_pair[0][3]))
+        for u in top_pair[0][:2]:
+            hits = [ts for text, ts in q("SELECT text, taken_at FROM posts WHERE username = ?", u)
+                    if hashtags_of(text) & shared_tags]
+            pair_posts.append((len(hits), {dt.datetime.fromtimestamp(ts, dt.timezone.utc).date() for ts in hits if ts}))
+    # join dates: on-topic authors in the study period (all location-checked accounts for comparison)
+    JOIN_POP = f"f.user_pk IN (SELECT DISTINCT p.user_pk FROM posts p {ON} WHERE {PER})"
+    joins = q(f"SELECT joined_month FROM user_features f WHERE joined_month IS NOT NULL AND {JOIN_POP}")
     n_join = len(joins)
     jul23 = sum(j == "2023-07" for (j,) in joins)
-    in_per_join = one("SELECT COUNT(*) FROM user_features WHERE joined_in_period = 1")
-    over100m = one("SELECT COUNT(*) FROM user_features WHERE signup_over_100m = 1")
+    in_per_join = one(f"SELECT COUNT(*) FROM user_features f WHERE joined_in_period = 1 AND {JOIN_POP}")
+    over100m = one(f"SELECT COUNT(*) FROM user_features f WHERE signup_over_100m = 1 AND {JOIN_POP}")
+    n_join_all, jul23_all, in_per_all = q("""SELECT COUNT(*), SUM(joined_month = '2023-07'), SUM(joined_in_period)
+                                             FROM user_features WHERE joined_month IS NOT NULL""")[0]
+    # page loads by outcome, and what became of the accounts behind failed lookups
+    by_status = dict(q("SELECT status, COUNT(*) FROM visits GROUP BY 1"))
+    ui_fate = Counter(r for (r,) in q("""
+        SELECT CASE WHEN v.target = 'Instagram user' THEN 'placeholder' ELSE COALESCE((
+            SELECT CASE WHEN u.country_raw = 'account_gone' THEN 'gone'
+                        WHEN u.country_raw LIKE 'ui_error%' THEN 'failed'
+                        WHEN u.country_checked_at IS NOT NULL THEN 'ok' ELSE 'renamed' END
+            FROM users u WHERE u.username = v.target LIMIT 1), 'renamed') END
+        FROM visits v WHERE v.kind = 'location' AND v.status = 'ui_error'"""))
+    n_placeholder = one("SELECT COUNT(*) FROM users WHERE username = 'Instagram user'")
     jul25, jul25_kh = q("""SELECT COUNT(*), COALESCE(SUM(u.country = 'Cambodia'), 0) FROM user_features f
                            JOIN users u ON u.pk = f.user_pk WHERE f.joined_month = '2025-07'""")[0]
     jul25_rand = one("""SELECT COUNT(*) FROM user_features f JOIN users u ON u.pk = f.user_pk
@@ -384,6 +437,38 @@ def main():
             a_, b_, c_, d_ = K[key], K["n"] - K[key], T[key], T["n"] - T[key]
             sig_tests[key] = ((a_ * d_) / (b_ * c_) if b_ and c_ else float("inf"), fisher_two_sided(a_, b_, c_, d_))
     pct = lambda grp, key: 100 * sig[grp][key] / sig[grp]["n"] if grp in sig and sig[grp]["n"] else 0  # noqa: E731
+    reg, jul_kh, gone_on = {}, {}, None
+    if complete:
+        # do the country gaps survive adjusting for how many posts were collected per account?
+        rr = q(f"""SELECT u.country, f.n_copy_posts > 0, f.n_campaign_tags > 0, f.n_posts FROM users u
+                   JOIN user_features f ON f.user_pk = u.pk WHERE u.pk IN ({AUTH})""")
+        X = np.array([[1, c == "Cambodia", c not in ("Cambodia", "Thailand"), math.log(max(n or 1, 1))]
+                      for c, _, _, n in rr], float)
+        reg_n = len(rr)
+        for key, col in (("copy", 1), ("campaign", 2)):
+            reg[key] = logit(X, np.array([bool(r[col]) for r in rr], float))
+        # Cambodia-based authors who joined in July 2025 vs those who joined in other months
+        for jul, n_, cp, ct_, only in q(f"""
+                SELECT f.joined_month = '2025-07', COUNT(*), SUM(f.n_copy_posts > 0), SUM(f.n_campaign_tags > 0),
+                       SUM((SELECT COUNT(*) FROM posts x WHERE x.user_pk = u.pk) =
+                           (SELECT COUNT(*) FROM posts p {ON} WHERE p.user_pk = u.pk))
+                FROM users u JOIN user_features f ON f.user_pk = u.pk
+                WHERE u.country = 'Cambodia' AND f.joined_month IS NOT NULL AND u.pk IN ({AUTH}) GROUP BY 1"""):
+            jul_kh["jul" if jul else "other"] = dict(n=n_, copy=cp, campaign=ct_, only=only)
+        if len(jul_kh) == 2:
+            J, O = jul_kh["jul"], jul_kh["other"]
+            for key in ("copy", "campaign", "only"):
+                a_, b_, c_, d_ = J[key], J["n"] - J[key], O[key], O["n"] - O[key]
+                jul_kh[key] = ((a_ * d_) / (b_ * c_) if b_ and c_ else float("inf"), fisher_two_sided(a_, b_, c_, d_))
+        # on-topic authors whose profile was gone when looked up
+        gone_on = q(f"""
+            SELECT COUNT(*), date(MIN(u.first_seen),'unixepoch'), date(MAX(u.first_seen),'unixepoch'),
+                   (SELECT date(MIN(v.started_at),'unixepoch') FROM visits v WHERE v.kind = 'location'
+                    AND v.target IN (SELECT username FROM users g WHERE g.country_raw = 'account_gone' AND g.pk IN ({AUTH}))),
+                   date(MIN(u.gone_at),'unixepoch'), date(MAX(u.gone_at),'unixepoch'),
+                   COALESCE(SUM(f.n_copy_posts > 0), 0), COALESCE(SUM(f.n_campaign_tags > 0), 0)
+            FROM users u LEFT JOIN user_features f ON f.user_pk = u.pk
+            WHERE u.country_raw = 'account_gone' AND u.pk IN ({AUTH})""")[0]
 
     # ---- charts
     fig_paths = {}
@@ -396,9 +481,9 @@ def main():
         if mo in months:
             i = months.index(mo)
             ax.axvspan(i - 0.5, i + 0.5, color=BAND, zorder=0, lw=0)
-    ax.bar(x, kw_v, width=0.62, color=S1, label="Matched by keywords (English originals)", zorder=2)
+    ax.bar(x, kw_v, width=0.62, color=S1, label="English original posts", zorder=2)
     ax.bar(x, th_v, width=0.62, bottom=kw_v, color=S2, edgecolor=SURF, linewidth=2,
-           label="Replies under those posts (any language)", zorder=2)
+           label="Replies (any language)", zorder=2)
     for mo, lab in (("2025-07", "July fighting"), ("2025-12", "December fighting")):
         if mo in months:
             i = months.index(mo)
@@ -410,7 +495,7 @@ def main():
     ax.set_xticks(list(x), [MONTHS[int(mo[5:]) - 1] + (f"\n{mo[:4]}" if i == 0 or mo.endswith("-01") else "")
                             for i, mo in enumerate(months)])
     ax.set_ylim(0, max(k + t for k, t in zip(kw_v, th_v)) * 1.3)
-    titles(ax, "On-topic posts per month", f"English originals + their replies (any language) · n = {n_on:,}")
+    titles(ax, "On-topic posts per month", f"English original posts + replies (any language) · n = {n_on:,}")
     leg = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=2, frameon=False, fontsize=8)
     [t.set_color(INK2) for t in leg.get_texts()]
     fig_paths["monthly"] = a.out / "fig_1_monthly.png"
@@ -523,8 +608,8 @@ def main():
     ax.set_yticks(list(ys), [tag_label(t) for t, _, _ in tags], fontsize=8)
     for yv, (_, n, _) in zip(ys, tags):
         ax.annotate(f"{n}", (n, yv), xytext=(4, 0), textcoords="offset points", va="center", fontsize=8.5, color=INK)
-    titles(ax, "Most widely used hashtags",
-           "Distinct accounts using each hashtag; non-Latin tags shown by meaning [language]")
+    titles(ax, "Most widely used hashtags in on-topic posts",
+           "Distinct accounts, study period; non-Latin tags shown by meaning [language]")
     fig_paths["hashtags"] = a.out / "fig_6_hashtags.png"
     save(fig, fig_paths["hashtags"])
 
@@ -569,8 +654,8 @@ def main():
             ax.axvspan(i - 0.5, i + 0.5, color=BAND, zorder=0, lw=0)
     ax.set_xticks([i for i, mo in enumerate(allm) if mo.endswith(("-01", "-07"))],
                   [MONTHS[int(mo[5:]) - 1] + f"\n{mo[:4]}" for mo in allm if mo.endswith(("-01", "-07"))])
-    titles(ax, "When the location-checked accounts joined Threads",
-           f"n = {n_join:,}; shaded = fighting months; July 2023 = Threads launch wave")
+    titles(ax, "When on-topic authors joined Threads",
+           f"On-topic authors with a join date, n = {n_join:,}; shaded = fighting months; July 2023 = Threads launch")
     fig_paths["joins"] = a.out / "fig_7_join_months.png"
     save(fig, fig_paths["joins"])
 
@@ -599,19 +684,23 @@ def main():
         ("Posts collected (all)", f"{n_posts:,}"),
         ("Accounts seen (all pages opened)", f"{n_users:,}"),
         ("On-topic posts in the study period", f"{n_on:,} from {n_on_acc:,} accounts"),
-        ("…matched by keywords (English originals)", f"{n_kw:,}"),
-        ("…replies under those posts (any language)", f"{n_thread:,}"),
+        ("…English original posts (keyword-matched)", f"{n_orig:,}"),
+        ("…replies (any language)", f"{n_reply:,}: {n_thread:,} under on-topic posts, "
+                                    f"{n_kw_reply:,} matching the keywords themselves"),
         ("Accounts with a 'Based in' country check", f"{checked:,} ({100 * with_c / checked:.0f}% show a country)"),
         ("Cross-account copy-paste clusters", f"{len(multi)} ({n_multi_on} with on-topic posts), up to {max_acc} accounts"),
         ("Campaign hashtags (20+ accounts)", f"{n_campaign}"),
-        ("Page loads", f"{n_visits:,} in {n_rounds} collection rounds, {first_run} to {last_run}; {n_ok:,} ok, no login walls"),
+        ("Page loads", f"{n_visits:,} in {n_rounds} collection rounds, {first_run} to {last_run}; {n_ok:,} ok, "
+                       + ", ".join(f"{n:,} {st}" for st, n in sorted(by_status.items(), key=lambda x: -x[1]) if st != "ok")
+                       + "; no login walls (see Location coverage)"),
     ], [9.5, 7.0])
     doc.add_paragraph("Key findings:")
     bullets(doc, [
         ("Activity follows the conflict. ", f"On-topic posting peaks in the two fighting months: "
          f"{phase_rows[1][4]:g} posts per day in July 2025 and {phase_rows[3][4]:g} in December 2025, "
          f"against {phase_rows[0][4]:g} before the fighting."),
-        ("Most of the volume is replies. ", f"{n_thread:,} of {n_on:,} on-topic posts are replies, many in Thai or Khmer."),
+        ("Most of the volume is replies. ", f"{n_reply:,} of {n_on:,} on-topic posts ({100 * n_reply / n_on:.0f}%) "
+         f"are replies, many in Thai or Khmer; the other {n_orig:,} are English original posts."),
         ("Both sides take part; English copy-paste comes from one. ", (
             f"Of all {sum(n for _, n in pop_countries):,} on-topic authors, "
             f"{100 * dict(pop_countries).get('Cambodia', 0) / sum(n for _, n in pop_countries):.0f}% are based in "
@@ -627,11 +716,8 @@ def main():
             f"p = {sig_tests['jul25'][1]:.0e}); there is no such wave in December.") if complete else
             "Accounts created in July 2025 are a lead to follow up (see Account age)."),
         ("Coordinated hashtags run in three languages. ", "The same 'Thailand started the war' slogan appears as "
-         "English, Thai and Khmer hashtags used by 200-300 accounts each, and whole sentences turned into "
-         "hashtags are shared by about 100 accounts."),
-        ("Thai-side coordination shows up in hashtags. ", (f"The strongest rare-hashtag pair is "
-         f"{top_pair[0][0]} + {top_pair[0][1]} ({top_pair[0][2]} shared rare tags), a Thai-side pair the "
-         f"copy-paste clusters did not reveal.") if top_pair else ""),
+         "English, Thai and Khmer hashtags, each used by hundreds of on-topic authors, and whole sentences "
+         "turned into hashtags are shared by more than 100."),
         ("These are coordination signals, not proof of fake accounts. ", "Labels remain an open question."),
     ])
 
@@ -662,7 +748,9 @@ def main():
         "Every reply found under an on-topic post is also on-topic, in any language and without keywords, "
         "because replies are often short, emoji-only, or in Thai or Khmer. Off-topic posts are kept and "
         "tagged, not deleted. A hand check of random on-topic posts found them relevant; posts that rely "
-        "on 'ASEAN' alone as the conflict term are about 20% false positives (3 of 15).")
+        "on 'ASEAN' alone as the conflict term are about 20% false positives (3 of 15). Replies found "
+        "elsewhere (in searches or on profiles) count as on-topic when their own text passes the keyword "
+        "rule, so the on-topic replies are those found under on-topic posts plus those keyword-matched replies.")
 
     doc.add_heading("Accounts in the dataset", level=2)
     doc.add_paragraph(
@@ -680,8 +768,8 @@ def main():
 
     doc.add_heading("3. What the data shows", level=1)
     doc.add_heading("Timeline", level=2)
-    figure(doc, fig_paths["monthly"], "Figure 1. On-topic posts per month. Blue: posts matched by "
-           "keywords; orange: replies under them. Shaded: fighting months.")
+    figure(doc, fig_paths["monthly"], "Figure 1. On-topic posts per month. Blue: English original posts; "
+           "orange: replies in any language (under on-topic posts, or matching the keywords). Shaded: fighting months.")
     table(doc, ["Phase", "Dates", "Days", "Posts", "Per day", "Authors", "Replies"],
           [(r[0], r[1], r[2], f"{r[3]:,}", r[4], f"{r[5]:,}", f"{r[6]:,}") for r in phase_rows],
           [3.3, 4.2, 1.2, 1.7, 1.6, 1.7, 1.6])
@@ -692,7 +780,8 @@ def main():
         "first), so part of the monthly shape reflects collection design, not only public activity.")
 
     doc.add_heading("Languages", level=2)
-    figure(doc, fig_paths["langs"], "Figure 3. Detected languages of the replies under on-topic posts.")
+    figure(doc, fig_paths["langs"], f"Figure 3. Detected languages of the {n_thread:,} replies found under "
+           f"on-topic posts (the {n_kw_reply:,} keyword-matched replies are English by construction).")
 
     doc.add_heading("Who takes part, and where they are based", level=2)
     if complete:
@@ -715,6 +804,18 @@ def main():
             "opened the author's profile and saved its visible posts, so these signals are measured the same "
             "way for every author. Caveats: only English original posts were searched, so Thai-language "
             "campaigns are under-represented; and coordination is not proof of fake accounts.")
+        if reg:
+            doc.add_paragraph(
+                "Accounts with more collected posts have more chances to land in a cluster or use a campaign tag, "
+                "and Cambodia-based authors have slightly more collected posts. A logistic regression on all "
+                f"{reg_n:,} on-topic authors, with country (Cambodia / Thailand / other or none) and "
+                "log(posts collected) as predictors, shows the country gap is not an activity effect:")
+            table(doc, ["Outcome", "Cambodia vs Thailand", "Other / none vs Thailand", "Per e-fold more posts"],
+                  [(lab, *(f"{o:.2f} ({lo:.2f}-{hi:.2f}), p = {pv:.0e}" for o, lo, hi, pv in reg[k]))
+                   for k, lab in (("copy", "In a copy-paste cluster"), ("campaign", "Uses campaign hashtags"))],
+                  [3.6, 4.4, 4.4, 4.2], font_pt=8)
+            doc.add_paragraph("Odds ratios with 95% Wald confidence intervals. 'Per e-fold more posts' is the "
+                              "odds ratio for 2.7 times as many collected posts.").runs[0].italic = True
     else:
         doc.add_paragraph(
             f"{checked} accounts were location-checked; {100 * with_c / checked:.0f}% show a 'Based in' country "
@@ -751,6 +852,28 @@ def main():
             "lookups failed three in a row and only recovered after roughly 24 hours. The sweep therefore "
             "kept to at most 800 lookups in any 24 hours, ran in batches of 100 with 25-minute breaks, and "
             "never hit a login wall.")
+    p = doc.add_paragraph()
+    p.add_run("Lookups that did not return a country. ").bold = True
+    p.add_run(
+        f"Of {by_status.get('ui_error', 0) + by_status.get('gone', 0):,} location lookups that did not succeed, "
+        f"{by_status.get('gone', 0):,} reached a removed or suspended profile ('the page is gone'; recorded as "
+        f"account_gone). The other {by_status.get('ui_error', 0):,} failed to open the panel: {ui_fate['gone']:,} "
+        "were removed accounts tried before removed-profile detection was added on 2026-10-25 (a retry then "
+        f"found them gone), {ui_fate['ok']:,} succeeded on a later retry, {ui_fate['placeholder']:,} tried "
+        f"to open 'Instagram user' (the name Threads shows for deactivated accounts; {n_placeholder} accounts in "
+        f"the database carry it, and it cannot be opened), {ui_fate['renamed']:,} targeted accounts renamed "
+        "since collection, and "
+        f"{ui_fate['failed']:,} still fail.")
+    if gone_on and gone_on[0]:
+        n_g, fs0, fs1, ff0, g0, g1, g_cp, g_ct = gone_on
+        doc.add_paragraph(
+            f"{n_g} on-topic authors ({100 * n_g / n_on_acc:.1f}%) were gone when looked up. They were first "
+            f"collected between {fs0} and {fs1}; their first lookup (from {ff0}) already failed, and a retry on "
+            f"{g0}{'' if g0 == g1 else ' to ' + g1} confirmed the removal, so each disappeared within weeks of "
+            f"being collected. Their country and join date are unknown (the panel no longer exists); {g_cp} of "
+            f"them were in a copy-paste cluster and {g_ct} used campaign hashtags. Removal is a possible weak "
+            "label (Meta removes some CIB accounts), but the reason is not shown: users also delete their own "
+            "accounts.")
     else:
         doc.add_paragraph(
             "Only the random sample (and the sweep, below) can describe on-topic authors as a whole; the "
@@ -796,20 +919,31 @@ def main():
         "trilingual Khmer/Chinese/English statement ('Thailand attacked first…') posted largely as replies "
         "under news posts from 24 July 2025, the first day of fighting. A three-account stock-tip spam "
         "group (identical text, copies 10 seconds apart) is kept as a positive control for any detector.")
-    figure(doc, fig_paths["hashtags"], "Figure 6. Hashtags used by the most accounts. Thai and Khmer "
-           "tags are shown by their meaning; the table below gives the original hashtags.")
+    figure(doc, fig_paths["hashtags"], "Figure 6. Hashtags used by the most accounts in on-topic posts of "
+           "the study period. Thai and Khmer tags are shown by their meaning; the table below gives the originals.")
     table(doc, ["Hashtag (as used)", "Language", "Meaning", "Accounts", "Posts"],
           [(t, tag_script(t), GLOSS.get(t, "" if tag_script(t) == "English" else "-"), n, p_)
            for t, n, p_ in top_tags[:10]], [6.0, 1.8, 5.2, 1.7, 1.5], font_pt=8)
     doc.add_paragraph(
-        f"Copy-paste clusters ignore hashtags, so hashtag co-usage is measured separately: {n_campaign} "
-        f"campaign hashtags are used by 20 or more accounts, and {n_pairs:,} account pairs share rare "
-        "hashtags (used by only 2-10 accounts). Shared rare hashtags are unlikely to be chance, but some "
-        "pairs are benign (news outlets share topical tags).")
+        "Copy-paste clusters ignore hashtags, so hashtag co-usage is measured separately. In on-topic posts of "
+        f"the study period, {n_campaign_on} hashtags are used by 20 or more accounts. The feature columns "
+        "(n_campaign_tags, n_rare_tag_partners) and hashtags.csv / hashtag_pairs.csv are computed over all "
+        f"collected posts, since an account's other posts show its habits: there, {n_campaign} campaign "
+        f"hashtags are used by 20 or more accounts, and {n_pairs:,} account pairs share rare hashtags (used "
+        "by only 2-10 accounts).")
+    if top_pair and pair_posts:
+        (na, da), (nb, db_) = pair_posts
+        doc.add_paragraph(
+            "Caution: a pair's n_shared counts tags, not separate acts of co-use, so a single post with a long "
+            "hashtag block that another account quotes or copies produces a high count. The top pair "
+            f"({top_pair[0][0]} + {top_pair[0][1]}, {top_pair[0][2]} shared tags) shares them through {na} and "
+            f"{nb} post(s) on {len(da | db_)} day(s). Shared rare hashtags need checking by number of separate "
+            "posts and days before they are read as coordination; some pairs are benign (news outlets "
+            "share topical tags).")
 
     doc.add_heading("Account age", level=2)
-    figure(doc, fig_paths["joins"], "Figure 7. Threads join month of the location-checked accounts"
-           + (" (all on-topic authors)." if complete else "."))
+    figure(doc, fig_paths["joins"], f"Figure 7. Threads join month of on-topic authors in the study period "
+           f"({n_join:,} of {n_on_acc:,} have a join date; removed accounts and failed lookups have none).")
     doc.add_paragraph(
         (f"{sum(g['jul25'] for g in sig.values()):,} on-topic authors joined Threads in July 2025, the month "
          f"the fighting began, {sig['Cambodia']['jul25']:,} of them based in Cambodia: "
@@ -822,9 +956,25 @@ def main():
          f"({jul25_kh} of them based in Cambodia). Most were selected as copy-cluster members or by the "
          f"earlier prioritized lookups; in the random group only {jul25_rand} of {n_rand} joined that month, "
          "so this is a lead to follow up, not a population-wide result. ") +
-        f"{100 * jul23 / n_join:.0f}% of checked accounts joined in the July 2023 launch wave and "
-        f"{100 * in_per_join / n_join:.0f}% joined during the study period. {100 * over100m / n_join:.0f}% "
+        f"Of the {n_join:,} on-topic authors with a join date, {100 * jul23 / n_join:.0f}% joined in the July "
+        f"2023 launch wave and {100 * in_per_join / n_join:.0f}% joined during the study period "
+        f"(all {n_join_all:,} location-checked accounts: {100 * jul23_all / n_join_all:.0f}% and "
+        f"{100 * in_per_all / n_join_all:.0f}%). {100 * over100m / n_join:.0f}% of on-topic authors "
         "signed up after the first 100 million accounts and so have no signup number.")
+    if len(jul_kh) > 2:
+        J, O = jul_kh["jul"], jul_kh["other"]
+        jp = lambda g, k: 100 * g[k] / g["n"]  # noqa: E731
+        doc.add_paragraph(
+            f"Are the July-2025 joiners a separate group? Among Cambodia-based on-topic authors, the {J['n']} who "
+            f"joined in July 2025 are compared with the {O['n']:,} who joined in other months. Posting only on "
+            f"this topic (every collected post on-topic): {jp(J, 'only'):.0f}% vs {jp(O, 'only'):.0f}% "
+            f"(p = {jul_kh['only'][1]:.2f}). In a copy-paste cluster: {jp(J, 'copy'):.0f}% vs {jp(O, 'copy'):.0f}% "
+            f"(OR = {jul_kh['copy'][0]:.2f}, p = {jul_kh['copy'][1]:.2f}). Uses campaign hashtags: "
+            f"{jp(J, 'campaign'):.0f}% vs {jp(O, 'campaign'):.0f}% (p = {jul_kh['campaign'][1]:.2f}). So the new "
+            "accounts look much like older Cambodia-based accounts, with at most a modest excess in copy-paste "
+            "clusters: the wave adds accounts to the same campaign rather than forming a separate "
+            "single-purpose group. Single-topic share is measured on "
+            "collected posts only (about a page of each profile).")
 
     doc.add_heading("4. Limitations", level=1)
     bullets(doc, [
@@ -843,6 +993,9 @@ def main():
          f"({100 * cov['All on-topic authors'][1] / n_on_acc:.1f}%) were checked, and only "
          f"{100 * cov['Replied to an on-topic post'][2] / cov['Replied to an on-topic post'][0]:.1f}% of "
          "repliers have a country; a full check is prepared (section 3)."),
+        ("Time zone cannot separate the two sides. ", "Thailand and Cambodia are both UTC+7, so tz_offset "
+         "and flag_tz_vs_country cannot tell a Thai account from a Cambodian one; the flag only catches "
+         "accounts posting on a clock far from Southeast Asia."),
         ("Throttling. ", "Reply loading was throttled after searches; searches and reply pages now run in "
          "separate sessions."),
         ("AI labels are disclosures. ", f"ai_label = NONE ({ai.get('NONE', 0):,} on-topic posts) does not "
