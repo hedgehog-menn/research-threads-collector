@@ -166,7 +166,8 @@ def main():
         return
     print(f"hashtags: {one('SELECT COUNT(*) FROM hashtags')}; campaign tags (20+ accounts): "
           f"{one('SELECT COUNT(*) FROM hashtags WHERE is_campaign = 1')}; "
-          f"account pairs sharing rare tags (2-10 accounts): {one('SELECT COUNT(*) FROM hashtag_pairs')}")
+          f"account pairs linked by rare tags (2-10 accounts) in 2+ separate posts each: "
+          f"{one('SELECT COUNT(*) FROM hashtag_pairs')}")
     print("top hashtags by distinct accounts (all collected posts):")
     for n, posts, tag in q("SELECT n_accounts, n_posts, tag FROM hashtags ORDER BY n_accounts DESC LIMIT 8"):
         print(f"  {n:>4} accounts  {posts:>4} posts  {tag}")

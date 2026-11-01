@@ -14,7 +14,7 @@ Files (UTF-8 with BOM so Excel shows Thai/Khmer correctly):
                        account-level features
   text_clusters.csv    copy-paste clusters that span 2+ accounts
   hashtags.csv         every hashtag in the collected posts
-  hashtag_pairs.csv    account pairs sharing rare hashtags
+  hashtag_pairs.csv    account pairs linked by rare hashtags in 2+ separate posts each
 Column meanings: see the data dictionary in the dataset report (scripts/make_report.py).
 """
 import argparse
@@ -127,7 +127,8 @@ def main():
                datetime(first_at,'unixepoch') AS first_utc, datetime(last_at,'unixepoch') AS last_utc
         FROM hashtags ORDER BY n_accounts DESC"""))
     write(a.out / "hashtag_pairs.csv", db.execute("""
-        SELECT user_a, user_b, n_shared, shared_tags FROM hashtag_pairs ORDER BY n_shared DESC"""))
+        SELECT user_a_pk, user_b_pk, user_a, user_b, n_shared, posts_a, posts_b, n_days, shared_tags
+        FROM hashtag_pairs ORDER BY MIN(posts_a, posts_b) DESC, n_days DESC, n_shared DESC"""))
 
 
 if __name__ == "__main__":

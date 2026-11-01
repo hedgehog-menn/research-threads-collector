@@ -308,20 +308,26 @@ class Store:
         self.db.commit()
         return len(rows)
 
-    def set_country(self, username: str, country, raw):
+    def set_country(self, user_pk: str, country, raw):
         if raw.startswith("ui_error:"):  # failed lookup: keep any country found earlier
             self.db.execute(
                 "UPDATE users SET country_checked_at=?,"
                 " country_raw = CASE WHEN country IS NULL THEN ? ELSE country_raw END"
-                " WHERE username=?",
-                (now(), raw, username),
+                " WHERE pk=?",
+                (now(), raw, user_pk),
             )
         else:
             self.db.execute(
-                "UPDATE users SET country=?, country_raw=?, country_checked_at=? WHERE username=?",
-                (country, raw, now(), username),
+                "UPDATE users SET country=?, country_raw=?, country_checked_at=? WHERE pk=?",
+                (country, raw, now(), user_pk),
             )
         self.db.commit()
+
+    def user_pk_of(self, username: str):
+        """pk for a username given on the command line (most recently seen if several)."""
+        row = self.db.execute("SELECT pk FROM users WHERE username = ? ORDER BY last_seen DESC LIMIT 1",
+                              (username,)).fetchone()
+        return row[0] if row else None
 
     def log_visit(self, run_id, kind, target, started, new, seen, status, n_responses=None,
                   reached_end=None):
@@ -504,6 +510,9 @@ class TooManyFailures(Exception):
 RESPONSE_TIMEOUT_S = 30   # reading one /graphql response body
 DRAIN_TIMEOUT_S = 30      # waiting for all pending responses after a scroll
 LOCATION_TIMEOUT_S = 120  # one whole "About this profile" lookup
+# Threads shows deactivated accounts under this shared name; many users rows carry it, and
+# /@Instagram user is no profile. Never look it up, and never update users by username.
+PLACEHOLDER_USERNAMES = ("Instagram user",)
 MAX_VISIT_FAILURES = 3    # consecutive failed/timed-out visits before the run stops
 
 
@@ -642,10 +651,12 @@ class Collector:
             self.reached_end = None
         print(f"[{source}] +{self.store.new_posts - start} new posts  ({url})")
 
-    async def fetch_country(self, username: str) -> bool:
+    async def fetch_country(self, username: str, user_pk=None) -> bool:
         """Best-effort: open 'About this profile' and read the 'Based in' line.
-        UI selectors WILL need adjusting - run with --headful the first time."""
+        UI selectors WILL need adjusting - run with --headful the first time.
+        Results are stored on user_pk (looked up from the username if not given)."""
         started = now()
+        user_pk = user_pk or self.store.user_pk_of(username)
         try:
             await self.page.goto(f"{BASE}/@{username}", wait_until="domcontentloaded", timeout=45_000)
             await self.page.wait_for_timeout(2500)
@@ -666,7 +677,7 @@ class Collector:
             self.store.db.execute(
                 "UPDATE users SET country_checked_at = ?, "
                 "country_raw = CASE WHEN country IS NULL THEN 'account_gone' ELSE country_raw END, "
-                "gone_at = ? WHERE username = ?", (now(), now(), username))
+                "gone_at = ? WHERE pk = ?", (now(), now(), user_pk))
             self.store.commit()
             print(f"[location] @{username}: account gone (removed or suspended)")
             self.store.log_visit(self.run_id, "location", username, started, 0, 0, "gone")
@@ -702,7 +713,7 @@ class Collector:
             await self.page.wait_for_timeout(1000)
             text = await dialog.inner_text()
         except Exception as e:
-            self.store.set_country(username, None, f"ui_error:{type(e).__name__}")
+            self.store.set_country(user_pk, None, f"ui_error:{type(e).__name__}")
             print(f"[location] @{username}: could not open dialog ({type(e).__name__})")
             self.store.log_visit(self.run_id, "location", username, started, 0, 0, "ui_error")
             return False
@@ -710,18 +721,23 @@ class Collector:
         country = m.group(1).strip() if m else None
         if country and country.lower() == "not shared":
             country = None  # user hid it; distinguishable from "no Based in row" via country_raw
-        self.store.set_country(username, country, text[:1000])
+        self.store.set_country(user_pk, country, text[:1000])
         print(f"[location] @{username}: {country or 'hidden/not shown'}")
         self.store.log_visit(self.run_id, "location", username, started, 0, 0, "ok")
         return True
 
-    async def locations(self, usernames, max_failures: int = 3):
-        """Look up countries; stop after `max_failures` consecutive dialog failures,
-        which usually means Threads is blocking (protect the account)."""
+    async def locations(self, targets, max_failures: int = 3):
+        """Look up countries for usernames or (username, user_pk) pairs; stop after
+        `max_failures` consecutive dialog failures, which usually means Threads is blocking
+        (protect the account)."""
         fails = 0
-        for u in usernames:
+        for t in targets:
+            u, pk = t if isinstance(t, tuple) else (t, None)
+            if u.lstrip("@") in PLACEHOLDER_USERNAMES:
+                print(f"[location] skipping placeholder name {u!r}")
+                continue
             try:
-                ok = await asyncio.wait_for(self.fetch_country(u.lstrip("@")), LOCATION_TIMEOUT_S)
+                ok = await asyncio.wait_for(self.fetch_country(u.lstrip("@"), pk), LOCATION_TIMEOUT_S)
             except TimeoutError:
                 print(f"[location] @{u}: timed out after {LOCATION_TIMEOUT_S} s")
                 self.store.log_visit(self.run_id, "location", u.lstrip("@"), now(), 0, 0, "timeout")
@@ -765,23 +781,28 @@ def load_topic(path) -> dict:
     return topic
 
 
+def skip_names(topic: dict) -> str:
+    """JSON list of usernames never to look up: the topic's exclusions and placeholders."""
+    return json.dumps(topic["exclude_users"] + list(PLACEHOLDER_USERNAMES))
+
+
 def pick_sweep(st: "Store", topic: dict, n: int):
     """Next n unchecked on-topic authors (study period if the topic has one) for a full
     location sweep. The order is a fixed pseudo-random shuffle (hash of topic + username),
     so batches continue the same list, and a sweep stopped part-way is still a random
     sample. Records users.lookup_reason = 'sweep'."""
     where_period = "AND p.taken_at BETWEEN ? AND ?" if topic["period_ts"] else ""
-    params = [topic["name"], *(topic["period_ts"] or ()), json.dumps(topic["exclude_users"])]
-    users = [r[0] for r in st.db.execute(
-        f"""SELECT DISTINCT p.username FROM posts p JOIN post_topics t
+    params = [topic["name"], *(topic["period_ts"] or ()), skip_names(topic)]
+    users = st.db.execute(
+        f"""SELECT DISTINCT p.username, u.pk FROM posts p JOIN post_topics t
               ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1
             JOIN users u ON u.pk = p.user_pk
             WHERE u.country_checked_at IS NULL {where_period}
-              AND p.username NOT IN (SELECT value FROM json_each(?))""", params)]
-    key = lambda u: hashlib.sha256(f"{topic['name']}:{u}".encode()).hexdigest()  # noqa: E731
+              AND p.username NOT IN (SELECT value FROM json_each(?))""", params).fetchall()
+    key = lambda r: (hashlib.sha256(f"{topic['name']}:{r[0]}".encode()).hexdigest(), r[1])  # noqa: E731
     picks = sorted(users, key=key)[:n]
-    st.db.executemany("UPDATE users SET lookup_reason = 'sweep' WHERE username = ?",
-                      [(u,) for u in picks])
+    st.db.executemany("UPDATE users SET lookup_reason = 'sweep' WHERE pk = ?",
+                      [(pk,) for _, pk in picks])
     st.commit()
     print(f"location sweep: {len(picks)} this batch, {len(users) - len(picks)} left after it")
     return picks
@@ -798,7 +819,7 @@ def pick_sweep_extended(st: "Store", topic: dict, n: int):
     which bring in new unrelated accounts, so tier 3 grows about as fast as it is checked."""
     since, until = topic["period_ts"] or (0, 2**62)
     rows = st.db.execute(
-        """SELECT u.username,
+        """SELECT u.username, u.pk,
                   CASE WHEN EXISTS (SELECT 1 FROM posts p JOIN post_topics t ON t.post_pk = p.pk
                                     AND t.topic = ? AND t.on_topic = 1
                                     WHERE p.user_pk = u.pk AND p.taken_at BETWEEN ? AND ?) THEN 0
@@ -815,16 +836,16 @@ def pick_sweep_extended(st: "Store", topic: dict, n: int):
                                                 WHERE topic = ? AND on_topic = 1))))
              AND u.username NOT IN (SELECT value FROM json_each(?))""",
         (topic["name"], since, until, topic["name"], int(os.environ.get("THREADS_SWEEP_TIER3") == "1"),
-         topic["name"], json.dumps(topic["exclude_users"]))).fetchall()
-    key = lambda r: (r[1], hashlib.sha256(f"{topic['name']}:{r[0]}".encode()).hexdigest())  # noqa: E731
+         topic["name"], skip_names(topic))).fetchall()
+    key = lambda r: (r[2], hashlib.sha256(f"{topic['name']}:{r[0]}".encode()).hexdigest(), r[1])  # noqa: E731
     picks = sorted(rows, key=key)[:n]
-    st.db.executemany("UPDATE users SET lookup_reason = ? WHERE username = ?",
-                      [("sweep" if tier == 0 else "sweep_ext", u) for u, tier in picks])
+    st.db.executemany("UPDATE users SET lookup_reason = ? WHERE pk = ?",
+                      [("sweep" if tier == 0 else "sweep_ext", pk) for _, pk, tier in picks])
     st.commit()
-    tiers = Counter(t for _, t in rows)
+    tiers = Counter(t for _, _, t in rows)
     print(f"location sweep: {len(picks)} this batch, {len(rows) - len(picks)} left after it "
           f"(unchecked by tier 0-3: {[tiers.get(i, 0) for i in range(4)]})")
-    return [u for u, _ in picks]
+    return [(u, pk) for u, pk, _ in picks]
 
 
 def pick_lookups(st: "Store", topic: dict, run_id: str, n: int):
@@ -837,21 +858,21 @@ def pick_lookups(st: "Store", topic: dict, run_id: str, n: int):
     in_clusters = {u for c in text_clusters(on_rows) if c["n_accounts"] >= 2
                    for u in json.loads(c["usernames"])}
     candidates = st.db.execute(
-        """SELECT p.username, COUNT(*) FROM posts p JOIN post_topics t
+        """SELECT p.username, u.pk, COUNT(*) FROM posts p JOIN post_topics t
              ON t.post_pk = p.pk AND t.topic = ? AND t.on_topic = 1
            JOIN users u ON u.pk = p.user_pk
            WHERE u.country_checked_at IS NULL
              AND p.username NOT IN (SELECT value FROM json_each(?))
-           GROUP BY p.username ORDER BY p.username""",
-        (topic["name"], json.dumps(topic["exclude_users"]))).fetchall()
-    clustered = sorted((r for r in candidates if r[0] in in_clusters), key=lambda r: -r[1])
-    others = [r[0] for r in candidates if r[0] not in in_clusters]
+           GROUP BY u.pk ORDER BY p.username, u.pk""",
+        (topic["name"], skip_names(topic))).fetchall()
+    clustered = sorted((r for r in candidates if r[0] in in_clusters), key=lambda r: -r[2])
+    others = [(u, pk) for u, pk, _ in candidates if u not in in_clusters]
     n_cluster = min(len(clustered), n // 2)
     n_random = min(len(others), n - n_cluster)
-    picks = [(u, "cluster") for u, _ in clustered[:n_cluster]]
-    picks += [(u, "random") for u in random.Random(run_id).sample(others, n_random)]
-    st.db.executemany("UPDATE users SET lookup_reason = ? WHERE username = ?",
-                      [(why, u) for u, why in picks])
+    picks = [(u, pk, "cluster") for u, pk, _ in clustered[:n_cluster]]
+    picks += [(u, pk, "random") for u, pk in random.Random(run_id).sample(others, n_random)]
+    st.db.executemany("UPDATE users SET lookup_reason = ? WHERE pk = ?",
+                      [(why, pk) for _, pk, why in picks])
     st.commit()
     return picks
 
@@ -993,9 +1014,9 @@ async def snowball(col: Collector, topic: dict, a):
             todo = (pick_sweep_extended if a.sweep_all else pick_sweep)(st, topic, a.max_locations)
         else:
             picks = pick_lookups(st, topic, col.run_id, a.max_locations)
-            n_cluster = sum(why == "cluster" for _, why in picks)
+            n_cluster = sum(why == "cluster" for _, _, why in picks)
             n_random = len(picks) - n_cluster
-            todo = [u for u, _ in picks]
+            todo = [(u, pk) for u, pk, _ in picks]
             print(f"location lookups: {len(todo)} ({n_cluster} copy-cluster members, "
                   f"{n_random} random on-topic authors)")
         await col.locations(todo)

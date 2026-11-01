@@ -231,13 +231,13 @@ ACCOUNT_COLUMNS = [
     ("flag_bio_vs_country, flag_tz_vs_country", "1 if the bio place or the time zone disagrees with based_in_country. Candidate inauthenticity signals, not labels."),
     ("n_copy_posts, n_copy_partners, fastest_copy_gap_s", "Posts in cross-account copy clusters, how many other accounts share copied text, and the closest-in-time copy in seconds."),
     ("min_signup_gap_to_partner", "Smallest signup-number difference to a copy partner (adjacent numbers would suggest batch-created accounts)."),
-    ("n_hashtags, n_campaign_tags, n_rare_tag_partners", "Distinct hashtags used; how many are campaign tags (20+ accounts); accounts sharing rare tags (used by 2-10 accounts) with this one."),
+    ("n_hashtags, n_campaign_tags, n_rare_tag_partners", "Distinct hashtags used; how many are campaign tags (20+ accounts); accounts linked to this one by rare tags (used by 2-10 accounts) in 2+ separate posts each, not counting copies or quotes of each other."),
     ("first_seen_utc, country_checked_utc", "When the account was first collected and when its location was checked."),
 ]
 OTHER_FILES = [
     ("text_clusters.csv", "One row per copy-paste cluster spanning 2+ accounts: n_posts, n_accounts, usernames, exact (1 = identical after normalization), first/last copy time, span_hours, min_gap_s, median_gap_s, min_signup_gap, sample_text."),
     ("hashtags.csv", "One row per hashtag: n_accounts, n_posts, is_campaign (20+ accounts), first/last use."),
-    ("hashtag_pairs.csv", "Account pairs sharing rare hashtags: user_a, user_b, n_shared, shared_tags."),
+    ("hashtag_pairs.csv", "Account pairs linked by rare hashtags: user_a_pk, user_b_pk, user_a, user_b, n_shared (shared rare tags), posts_a / posts_b (separate posts carrying them, copies and quotes of each other excluded; 2+ each), n_days, shared_tags."),
 ]
 
 
@@ -325,14 +325,21 @@ def main():
     n_campaign_on = sum(len(us) >= CAMPAIGN_MIN_ACCOUNTS for us in tag_users.values())
     n_campaign = one("SELECT COUNT(*) FROM hashtags WHERE is_campaign = 1")
     n_pairs = one("SELECT COUNT(*) FROM hashtag_pairs")
-    top_pair = q("SELECT user_a, user_b, n_shared, shared_tags FROM hashtag_pairs ORDER BY n_shared DESC LIMIT 1")
-    pair_posts = []  # per account of the top pair: posts carrying any shared tag, and their days
-    if top_pair:
-        shared_tags = set(json.loads(top_pair[0][3]))
-        for u in top_pair[0][:2]:
-            hits = [ts for text, ts in q("SELECT text, taken_at FROM posts WHERE username = ?", u)
-                    if hashtags_of(text) & shared_tags]
-            pair_posts.append((len(hits), {dt.datetime.fromtimestamp(ts, dt.timezone.utc).date() for ts in hits if ts}))
+    # strongest rare-tag pairs: most separate posts on the weaker side, then days, then tags
+    top_pairs = q("""SELECT h.user_a, h.user_b, COALESCE(ua.country, '-'), COALESCE(ub.country, '-'),
+                            h.posts_a, h.posts_b, h.n_days, h.n_shared, h.shared_tags
+                     FROM hashtag_pairs h LEFT JOIN users ua ON ua.pk = h.user_a_pk
+                     LEFT JOIN users ub ON ub.pk = h.user_b_pk
+                     ORDER BY MIN(h.posts_a, h.posts_b) DESC, h.n_days DESC, h.n_shared DESC LIMIT 6""")
+    # pairs where both accounts are on-topic authors, by the pair's countries
+    pair_mix = Counter(r for (r,) in q(f"""
+        SELECT CASE WHEN ua.country = 'Thailand' AND ub.country = 'Thailand' THEN 'both Thailand'
+                    WHEN ua.country = 'Cambodia' AND ub.country = 'Cambodia' THEN 'both Cambodia'
+                    WHEN ua.country IN ('Thailand', 'Cambodia') AND ub.country IN ('Thailand', 'Cambodia')
+                         THEN 'one each' ELSE 'other / none' END
+        FROM hashtag_pairs h JOIN users ua ON ua.pk = h.user_a_pk JOIN users ub ON ub.pk = h.user_b_pk
+        WHERE h.user_a_pk IN (SELECT DISTINCT p.user_pk FROM posts p {ON} WHERE {PER})
+          AND h.user_b_pk IN (SELECT DISTINCT p.user_pk FROM posts p {ON} WHERE {PER})"""))
     # join dates: on-topic authors in the study period (all location-checked accounts for comparison)
     JOIN_POP = f"f.user_pk IN (SELECT DISTINCT p.user_pk FROM posts p {ON} WHERE {PER})"
     joins = q(f"SELECT joined_month FROM user_features f WHERE joined_month IS NOT NULL AND {JOIN_POP}")
@@ -708,8 +715,11 @@ def main():
             f"{100 * dict(pop_countries).get('Cambodia', 0) / sum(n for _, n in pop_countries):.0f}% are based in "
             f"Cambodia and {100 * dict(pop_countries).get('Thailand', 0) / sum(n for _, n in pop_countries):.0f}% in "
             f"Thailand, but {pct('Cambodia', 'copy'):.0f}% of Cambodia-based authors appear in copy-paste clusters "
-            f"against {pct('Thailand', 'copy'):.1f}% of Thailand-based ones (Fisher exact OR = "
-            f"{sig_tests['copy'][0]:.1f}, p = {sig_tests['copy'][1]:.0e}).") if complete else (
+            f"against {pct('Thailand', 'copy'):.1f}% of Thailand-based ones (OR = {reg['copy'][0][0]:.1f}, 95% CI "
+            f"{reg['copy'][0][1]:.1f}–{reg['copy'][0][2]:.1f}), and {pct('Cambodia', 'campaign'):.0f}% against "
+            f"{pct('Thailand', 'campaign'):.0f}% use campaign hashtags (OR = {reg['campaign'][0][0]:.1f}, 95% CI "
+            f"{reg['campaign'][0][1]:.1f}–{reg['campaign'][0][2]:.1f}). Odds ratios are adjusted for the number "
+            "of posts collected per account (logistic regression, see section 3).") if complete else (
             f"A random sample of on-topic authors is split {rt} Thailand / {rk} Cambodia, but copy-paste cluster "
             f"members are {ck} Cambodia / {ct} Thailand (Fisher exact OR = {odds:.2f}, p = {p_fisher:.1e}).")),
         ("A wave of new accounts at the start of the fighting. ", (
@@ -800,9 +810,11 @@ def main():
                 f"{sig_tests[k][0]:.1f}", f"{sig_tests[k][1]:.0e}") for k, lab in SIGNALS],
               [4.6, 2.3, 2.3, 2.2, 2.6, 2.0], font_pt=8)
         doc.add_paragraph(
-            "Reading: both sides take part in about equal numbers, but coordination signals are far more "
-            "common among Cambodia-based authors: copy-paste and campaign hashtags most of all, and to a "
-            "lesser degree shared rare hashtags, which also appear on the Thai side. Each location lookup "
+            "Reading: both sides take part in about equal numbers, but copy-paste and campaign hashtags are far "
+            "more common among Cambodia-based authors. Rare-tag links (two accounts each using the same rare "
+            f"tags in 2+ separate posts) are about as common on both sides ({pct('Cambodia', 'rare'):.1f}% vs "
+            f"{pct('Thailand', 'rare'):.1f}%, p = {sig_tests['rare'][1]:.1f}), and the strongest ones are shared "
+            "interests outside the conflict (see Coordination signals). Each location lookup "
             "opened the author's profile and saved its visible posts, so these signals are measured the same "
             "way for every author. Caveats: only English original posts were searched, so Thai-language "
             "campaigns are under-represented; and coordination is not proof of fake accounts.")
@@ -931,17 +943,25 @@ def main():
         f"the study period, {n_campaign_on} hashtags are used by 20 or more accounts. The feature columns "
         "(n_campaign_tags, n_rare_tag_partners) and hashtags.csv / hashtag_pairs.csv are computed over all "
         f"collected posts, since an account's other posts show its habits: there, {n_campaign} campaign "
-        f"hashtags are used by 20 or more accounts, and {n_pairs:,} account pairs share rare hashtags (used "
-        "by only 2-10 accounts).")
-    if top_pair and pair_posts:
-        (na, da), (nb, db_) = pair_posts
-        doc.add_paragraph(
-            "Caution: a pair's n_shared counts tags, not separate acts of co-use, so a single post with a long "
-            "hashtag block that another account quotes or copies produces a high count. The top pair "
-            f"({top_pair[0][0]} + {top_pair[0][1]}, {top_pair[0][2]} shared tags) shares them through {na} and "
-            f"{nb} post(s) on {len(da | db_)} day(s). Shared rare hashtags need checking by number of separate "
-            "posts and days before they are read as coordination; some pairs are benign (news outlets "
-            "share topical tags).")
+        "hashtags are used by 20 or more accounts.")
+    doc.add_paragraph(
+        "Rare-tag links. Two accounts are linked when each used rare hashtags (used by only 2-10 accounts) that "
+        "the other also used, in at least two separate posts. Posts that copy or quote a post of the other "
+        "account (same text, same copy-paste cluster, or a quote) are left out, so one copied post with a long "
+        f"hashtag block does not count as many shared tags. {n_pairs:,} pairs meet this rule"
+        + (f"; among pairs of on-topic authors: " + ", ".join(f"{n:,} {k}" for k, n in pair_mix.most_common())
+           if pair_mix else "") + ". The strongest pairs (most separate posts on the weaker side):")
+    if top_pairs:
+        table(doc, ["Accounts", "Based in", "Posts (each)", "Days", "Shared rare tags", "Examples"],
+              [(f"{a_} + {b_}", f"{ca} / {cb}", f"{pa_} / {pb_}", nd, ns,
+                ", ".join(json.loads(tags)[:3])) for a_, b_, ca, cb, pa_, pb_, nd, ns, tags in top_pairs],
+              [4.4, 2.8, 1.7, 1.1, 1.6, 5.0], font_pt=8)
+    doc.add_paragraph(
+        "The strongest links are shared interests (football, Formula 1, food videos, follow-for-follow tags), "
+        "not the conflict: 'rare' means rare in this collection, which holds only about a page of each "
+        "profile, not rare on Threads. Shared rare tags show common interests or a common source as well as "
+        "coordination; check a pair's posts before reading it as coordination. Restricting the links to "
+        "topic-related tags or on-topic posts would be a stronger coordination feature.")
 
     doc.add_heading("Account age", level=2)
     figure(doc, fig_paths["joins"], f"Figure 7. Threads join month of on-topic authors in the study period "
@@ -1024,6 +1044,11 @@ def main():
     doc.add_heading("6. Open questions", level=1)
     bullets(doc, [
         ("Labels: ", "weak labels from accounts suspended later, manual annotation, or copy-cluster positives?"),
+        *([("Suspension-based weak labels: ", f"so far only {gone_on[0]} on-topic authors are gone "
+            f"({gone_on[6]} in copy-paste clusters, {gone_on[7]} using campaign hashtags), too few to label "
+            "with. Plan a full re-check of all on-topic authors in 1-2 months (about a week of lookups at "
+            "the safe daily limit) to see whether removals accumulate, and among which accounts.")]
+          if gone_on else []),
         ("Scope: ", "add Thai and Khmer original posts? The multilingual hashtag campaigns suggest the main "
          "activity is not English-only."),
         ("Data source: ", "continue scraping, or move to Meta Content Library if approved?"),
