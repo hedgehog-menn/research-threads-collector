@@ -409,6 +409,8 @@ def main():
         FROM posts p JOIN post_topics t ON t.post_pk = p.pk AND t.topic = '{name}' AND t.on_topic = 0
         JOIN post_features f ON f.post_pk = p.pk
         WHERE p.source LIKE 'search%' AND p.user_pk NOT IN (SELECT user_pk FROM onp)""")[0]
+    after_n, after_acc = q(f"""SELECT COUNT(*), COUNT(DISTINCT p.user_pk) FROM posts p {ON}
+                               WHERE p.taken_at >= strftime('%s','{per['to']}','+1 day')""")[0]
     ai = Counter(dict(q(f"SELECT COALESCE(p.ai_label,'(missing)'), COUNT(*) FROM posts p {ON} WHERE {PER} GROUP BY 1")))
     # rare-tag links restricted to on-topic posts (tried as a feature; dropped as too sparse)
     _, topic_pairs, topic_tag_user = hashtag_features(
@@ -787,11 +789,13 @@ def main():
     table(doc, ["Why the account is not among the on-topic authors", "Accounts"],
           [(r, f"{n:,}") for r, n in origin], [12.5, 3.0])
     doc.add_paragraph(
-        f"Most search hits that failed the rule are on the topic but outside the date window: "
-        f"{search_fail[0]:,} accounts wrote English posts about the conflict after January 2026 (the "
-        f"ceasefire and maritime-talk phase), and {search_fail[1]:,} wrote short, emoji-only or non-English "
-        "replies that the keyword rule can't classify. Extending the study period into 2026 would bring "
-        "many of them in with no new collection, only a re-tag.")
+        f"Search hits that failed the rule are mostly not about the conflict: Threads search also returns "
+        f"loosely related and suggested posts. {search_fail[0]:,} accounts had only such English posts "
+        f"outside the study period (a sample: travel, US politics, follow-for-follow posts), and "
+        f"{search_fail[1]:,} wrote short, emoji-only or non-English posts that the keyword rule can't "
+        "classify. The on-topic rule does not depend on dates, so on-topic posts after January 2026 are "
+        f"already tagged: only {after_n:,} from {after_acc:,} accounts, because collection targeted the "
+        "study period and their reply pages were not opened.")
 
     doc.add_heading("3. What the data shows", level=1)
     doc.add_heading("Timeline", level=2)
@@ -1081,8 +1085,9 @@ def main():
          f"accounts, about {sweep_wall_h / 24:.1f} days, some risk to the research account), or settle for a "
          "random sample of about 400 (within about 5 points)? This decides whether country can be a "
          "per-account feature for the classifiers.")]),
-        ("Study period: ", "extend into 2026 (the ceasefire and maritime-talk phase) to add a 'long after' "
-         "phase for drift?"),
+        ("Study period: ", f"extend into 2026 (the ceasefire and maritime-talk phase) to add a 'long after' "
+         f"phase for drift? Only {after_n:,} on-topic posts after January 2026 are collected so far, so this "
+         "needs new collection (searches and reply pages for 2026 posts), not just a re-tag."),
     ])
 
     out = a.out / "threads_dataset_report.docx"
