@@ -4,6 +4,7 @@ export_csv.py - analysis-ready CSV export of one topic's study period.
 
   python scripts/export_csv.py                          # threads.db, th_kh_border_en -> export/csv/
   python scripts/export_csv.py --db copy.db --out somewhere/
+  python scripts/export_csv.py --all-posts               # also posts_all.csv (every collected post)
 
 Run `threads_collector.py tag <topic>` and `features.py --topic <topic>` first.
 
@@ -15,6 +16,8 @@ Files (UTF-8 with BOM so Excel shows Thai/Khmer correctly):
   text_clusters.csv    copy-paste clusters that span 2+ accounts
   hashtags.csv         every hashtag in the collected posts
   hashtag_pairs.csv    account pairs linked by rare hashtags in 2+ separate posts each
+  posts_all.csv        (--all-posts) every collected post, any topic or date, with on_topic and
+                       in_period flags and the author's country
 Column meanings: see the data dictionary in the dataset report (scripts/make_report.py).
 """
 import argparse
@@ -55,6 +58,7 @@ def main():
     ap.add_argument("--db", default="threads.db")
     ap.add_argument("--topic", default="topics/th_kh_border_en.json")
     ap.add_argument("--out", type=Path, default=Path("export/csv"))
+    ap.add_argument("--all-posts", action="store_true", help="also write posts_all.csv")
     a = ap.parse_args()
     topic = json.loads(Path(a.topic).read_text(encoding="utf-8"))
     name, per = topic["name"], topic["period"]
@@ -89,6 +93,26 @@ def main():
         return cols + ["hashtags"], [list(r) + [json.dumps(sorted(hashtags_of(r[i])), ensure_ascii=False)]
                                      for r in rows]
     write(a.out / "posts_on_topic.csv", posts, add_hashtags)
+
+    if a.all_posts:
+        write(a.out / "posts_all.csv", db.execute(f"""
+            SELECT p.pk AS post_id, p.url, datetime(p.taken_at,'unixepoch') AS posted_utc,
+                   CASE WHEN {in_period} THEN 1 ELSE 0 END AS in_period,
+                   CASE WHEN {in_period} THEN {phase_sql('p.taken_at')} END AS phase,
+                   COALESCE(t.on_topic, 0) AS on_topic, t.match AS on_topic_reason, t.matched_keywords,
+                   p.username, p.user_pk AS user_id, u.country AS author_country, p.text, f.lang,
+                   p.is_reply, p.found_as, p.reply_to_username, p.root_post_username,
+                   p.like_count, p.reply_count, p.repost_count, p.quote_count, p.reshare_count,
+                   p.media_type, p.link_url, p.quoted_post_pk AS quoted_post_id, p.is_edited, p.ai_label,
+                   c.cluster_id AS copy_cluster_id, c.n_accounts AS copy_cluster_accounts,
+                   p.source AS found_via, datetime(p.first_scraped_at,'unixepoch') AS first_scraped_utc
+            FROM posts p
+            LEFT JOIN post_topics t ON t.post_pk = p.pk AND t.topic = ?
+            LEFT JOIN users u ON u.pk = p.user_pk
+            LEFT JOIN post_features f ON f.post_pk = p.pk
+            LEFT JOIN post_text_clusters pc ON pc.post_pk = p.pk
+            LEFT JOIN text_clusters c ON c.cluster_id = pc.cluster_id AND c.n_accounts >= 2
+            ORDER BY p.taken_at""", (name,)), add_hashtags)
 
     write(a.out / "accounts.csv", db.execute(f"""
         WITH mine AS (SELECT p.user_pk, COUNT(*) AS n_on_topic_posts, SUM(p.is_reply) AS n_on_topic_replies
