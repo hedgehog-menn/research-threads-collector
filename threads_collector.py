@@ -353,7 +353,11 @@ class Store:
                      short or in Thai/Khmer). The link is posts.source = 'post:<url>' -
                      replies are only collected from that page's reply section, and the
                      reply payload itself carries no parent post id.
-        post_topics.match records why: "keywords" or "thread"."""
+        hashtags    - ASCII hashtags are also split into words for matching (#ThailandStartedTheWar
+                     -> Thailand Started The War; lowercase tags are searched for terms of 4+
+                     letters), since whole-word matching can't see inside them.
+        post_topics.match records why: "keywords", "hashtag" (matches only once hashtags are
+        split) or "thread"."""
         kws = [(k, keyword_matcher(k)) for k in topic["keywords"]]
         groups = topic.get("require_any") or []
         if groups and isinstance(groups[0], str):
@@ -368,12 +372,22 @@ class Store:
         rows = self.db.execute("SELECT pk, text, is_reply, url, source, found_as FROM posts").fetchall()
         result = {}  # pk -> (on_topic, matched keywords, match)
         on_urls = set()
+        terms = list(topic["keywords"]) + [k for g in groups for k in g]
+
+        def matches(t):
+            return ([k for k, match in kws if match(t)],
+                    all(any(m(t) for m in g) for g in ctx))
+
         for pk, text, is_reply, url, _, _ in rows:
-            hits = [k for k, match in kws if match(text or "")]
-            ok = (bool(hits)
-                  and all(any(m(text or "") for m in g) for g in ctx)
+            text = text or ""
+            hits, ctx_ok = matches(text)
+            why = "keywords"
+            if not (hits and ctx_ok) and "#" in text:
+                hits, ctx_ok = matches(text + " " + hashtag_words(text, terms))
+                why = "hashtag"
+            ok = (bool(hits) and ctx_ok
                   and (is_reply or not langs or analyzer.analyze(text)["lang"] in langs))
-            result[pk] = (int(ok), hits, "keywords" if ok else None)
+            result[pk] = (int(ok), hits, why if ok else None)
             if ok and url:
                 on_urls.add(url)
         if topic.get("reply_scope") == "thread":
@@ -764,6 +778,25 @@ def keyword_matcher(kw: str):
         return lambda text: bool(rx.search(text.lower()))
     low = kw.lower()
     return lambda text: low in text.lower()
+
+
+TAG_BODY_RE = re.compile(r"#([A-Za-z0-9_]+)")
+CAMEL_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+TAG_SUBSTR_MIN = 4  # shorter terms (war, UN, ICJ) only match as CamelCase words, not substrings
+
+
+def hashtag_words(text: str, terms) -> str:
+    """Words hidden in ASCII hashtags, for topic matching only (stored text is unchanged):
+    CamelCase parts (#ThailandStartedTheWar -> Thailand Started The War), plus any ASCII term
+    of 4+ letters found inside a tag, spaces ignored (#justiceforcambodia -> Cambodia)."""
+    out = []
+    for body in TAG_BODY_RE.findall(text or ""):
+        out.extend(CAMEL_RE.findall(body))
+        low = body.lower()
+        out.extend(k for k in terms
+                   if k.isascii() and len(k.replace(" ", "")) >= TAG_SUBSTR_MIN
+                   and k.replace(" ", "").lower() in low)
+    return " ".join(out)
 
 
 def load_topic(path) -> dict:
