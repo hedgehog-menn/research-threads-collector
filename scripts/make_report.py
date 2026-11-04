@@ -196,7 +196,7 @@ POST_COLUMNS = [
     ("lang", "Detected language: writing system first (km, th, zh, ja, ko), Lingua for Latin-script text of 12+ letters; und = too short or emoji-only."),
     ("is_reply", "1 if the post is a reply to another post."),
     ("found_as", "How the post appeared on the page it was collected from: result (search hit, profile post, post-page target), reply, parent (context above a reply), quoted, other."),
-    ("on_topic_reason", "keywords = matched the topic's keyword rule; thread = a reply under an on-topic post (any language, no keywords needed)."),
+    ("on_topic_reason", "keywords = matched the topic's keyword rule; hashtag = matched only once hashtags are split into words (#ThailandStartedTheWar); thread = a reply under an on-topic post (any language, no keywords needed)."),
     ("matched_keywords", "JSON list of the Cambodian-side keywords found in the text."),
     ("reply_to_username", "For replies: the account being replied to."),
     ("root_post_username", "For replies: the author of the post that started the conversation."),
@@ -265,7 +265,14 @@ def main():
     n_ok = one("SELECT COUNT(*) FROM visits WHERE status = 'ok'")
     n_on = one(f"SELECT COUNT(*) FROM posts p {ON} WHERE {PER}")
     n_on_acc = one(f"SELECT COUNT(DISTINCT p.user_pk) FROM posts p {ON} WHERE {PER}")
-    n_kw = one(f"SELECT COUNT(*) FROM posts p {ON} WHERE {PER} AND COALESCE(t.match,'keywords') = 'keywords'")
+    n_kw = one(f"SELECT COUNT(*) FROM posts p {ON} WHERE {PER} AND COALESCE(t.match,'keywords') != 'thread'")
+    # 'hashtag': passes only once hashtags are split into words (#ThailandStartedTheWar)
+    n_hashtag = one(f"SELECT COUNT(*) FROM posts p {ON} WHERE {PER} AND t.match = 'hashtag'")
+    n_hashtag_orig = one(f"SELECT COUNT(*) FROM posts p {ON} WHERE {PER} AND t.match = 'hashtag' AND p.is_reply = 0")
+    # on-topic originals with replies whose reply page was never opened (new since the hashtag fix)
+    n_unopened = one(f"""SELECT COUNT(*) FROM posts p {ON} WHERE {PER} AND p.is_reply = 0
+                          AND p.reply_count > 0 AND p.url IS NOT NULL
+                          AND NOT EXISTS (SELECT 1 FROM visits v WHERE v.kind = 'post' AND v.target = p.url)""")
     n_thread = n_on - n_kw
     # originals are all keyword-matched; replies come from thread pages or match the keywords themselves
     n_orig = one(f"SELECT COUNT(*) FROM posts p {ON} WHERE {PER} AND p.is_reply = 0")
@@ -430,7 +437,10 @@ def main():
     seeds = topic["seeds"]
 
     # ---- whole-population location results (meaningful once the sweep is complete)
-    complete = to_check == 0
+    # the sweep checked every on-topic author; a few new ones (e.g. from a later change to the
+    # on-topic rule) don't turn the whole-population results back into a sample
+    n_authors = cov["All on-topic authors"][0]
+    complete = sweep_done > 0 and to_check <= 0.01 * n_authors
     # extended sweep: accounts beyond the on-topic authors (sweep_ext)
     ext_n, ext_c = q("""SELECT COUNT(*), COALESCE(SUM(country IS NOT NULL), 0) FROM users
                         WHERE lookup_reason = 'sweep_ext' AND country_checked_at IS NOT NULL""")[0]
@@ -762,7 +772,10 @@ def main():
         ("Seed accounts: ", ", ".join("@" + s for s in seeds) + ". Two Thai-side, two Cambodian-side and "
          "four international outlets; each profile was scrolled back to the start of the study period."),
         ("Reply pages: ", "the page of every on-topic English post with replies in the study period was "
-         "opened to collect its replies (all of them have been opened)."),
+         "opened to collect its replies"
+         + (f", except {n_unopened:,} posts that only became on-topic when hashtag matching was added "
+            "(November 2026); their replies are not collected yet." if n_unopened else
+            " (all of them have been opened).")),
         ("Profiles and location: ", "repliers' and authors' profiles, plus 'About this profile' lookups "
          "for the 'Based in' country and join date, half for copy-cluster members and half for a random "
          "sample of on-topic authors."),
@@ -773,7 +786,11 @@ def main():
     doc.add_paragraph(
         "An original post is on-topic if it is in English and contains a Cambodian-side term (Cambodia, "
         "Khmer, Hun Sen, Preah Vihear…), a Thai-side term (Thailand, Thai, Anutin, Surin…) and a conflict "
-        "term (border, troops, ceasefire, shelling, landmines…). English terms match whole words only. "
+        "term (border, troops, ceasefire, shelling, landmines, opened fire…). English terms match whole words "
+        "only; hashtags are also split into words (#ThailandStartedTheWar is read as 'Thailand Started The "
+        f"War'), which adds {n_hashtag:,} posts ({n_hashtag_orig:,} originals) that the plain-text rule "
+        "missed; these are marked match = 'hashtag' and can be excluded. A post counts as English if its "
+        "whole text or its text without hashtags is detected as English. "
         "Every reply found under an on-topic post is also on-topic, in any language and without keywords, "
         "because replies are often short, emoji-only, or in Thai or Khmer. Off-topic posts are kept and "
         "tagged, not deleted. A hand check of random on-topic posts found them relevant; posts that rely "
@@ -881,7 +898,11 @@ def main():
         p.add_run("Full check (complete). ").bold = True
         p.add_run(
             f"The sweep checked every remaining on-topic author in a fixed random order ({sweep_done:,} accounts, "
-            "2026-10-14 to 2026-10-19). Threads limits 'About this profile': after about 925 lookups in a day, "
+            "2026-10-14 to 2026-10-19)"
+            + (f"; {to_check:,} authors who became on-topic when hashtag matching was added (November 2026) "
+               "are not checked yet and are left out of the country comparisons" if to_check else "")
+            + ". "
+            "Threads limits 'About this profile': after about 925 lookups in a day, "
             "lookups failed three in a row and only recovered after roughly 24 hours. The sweep therefore "
             "kept to at most 800 lookups in any 24 hours, ran in batches of 100 with 25-minute breaks, and "
             "never hit a login wall.")
@@ -928,7 +949,7 @@ def main():
                "per group): copy-cluster members vs a random sample. The full results above confirm it.")
     if ext_n:
         p = doc.add_paragraph()
-        ext_done = not related_left
+        ext_done = related_left <= 0.01 * (ext_n + n_authors)  # a few new ones after a rule change
         p.add_run("Beyond the on-topic authors" + ("" if ext_done else " (in progress)") + ". ").bold = True
         p.add_run(
             ("A second sweep checked all " if ext_done else "A second sweep is checking the ")
@@ -936,7 +957,9 @@ def main():
             f"posts, repliers whose posts failed the keyword rule, and on-topic authors outside the study "
             f"period. {'In total' if ext_done else 'So far'} {ext_n:,} have been checked "
             f"({100 * ext_c / ext_n:.0f}% show a country; these peripheral accounts more often lack one)"
-            + ("" if ext_done else f" and about {related_left:,} remain") + ". Their countries: "
+            + (f" and about {related_left:,} remain" if not ext_done else
+               f"; {related_left:,} that appeared after the on-topic rule changed are not checked yet"
+               if related_left else "") + ". Their countries: "
             + ", ".join(f"{c} {n:,}" for c, n in ext_countries) + ". "
             f"Across the whole database, {all_checked:,} accounts are now checked and {all_with_c:,} have a "
             "country. Accounts seen only on profiles opened during lookups are not checked, because every "
