@@ -346,7 +346,10 @@ class Store:
                      as substrings. matched_keywords is recorded either way.
         require_any - the post must also contain one of these (context words); a list of
                      lists means one word from EACH group
-        languages  - ORIGINAL posts (is_reply = 0) must be detected as one of these.
+        languages  - ORIGINAL posts (is_reply = 0) must be detected as one of these, either on
+                     the whole text or on the text without hashtags (the words of a hashtag-only
+                     post; see topic_lang). Either is enough: tags in three scripts can outweigh
+                     a sentence, and a short sentence without its tags is often misread.
                      Replies that match the keywords count in any language.
         reply_scope - "thread": a reply found on the post page of an on-topic post is
                      on-topic too, in any language and without keywords (replies are often
@@ -386,7 +389,8 @@ class Store:
                 hits, ctx_ok = matches(text + " " + hashtag_words(text, terms))
                 why = "hashtag"
             ok = (bool(hits) and ctx_ok
-                  and (is_reply or not langs or analyzer.analyze(text)["lang"] in langs))
+                  and (is_reply or not langs or analyzer.analyze(text)["lang"] in langs
+                       or topic_lang(analyzer, text) in langs))
             result[pk] = (int(ok), hits, why if ok else None)
             if ok and url:
                 on_urls.add(url)
@@ -781,6 +785,7 @@ def keyword_matcher(kw: str):
 
 
 TAG_BODY_RE = re.compile(r"#([A-Za-z0-9_]+)")
+TAG_ANY_RE = re.compile(r"#[^\s#]+")
 CAMEL_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
 TAG_SUBSTR_MIN = 4  # shorter terms (war, UN, ICJ) only match as CamelCase words, not substrings
 
@@ -797,6 +802,21 @@ def hashtag_words(text: str, terms) -> str:
                    if k.isascii() and len(k.replace(" ", "")) >= TAG_SUBSTR_MIN
                    and k.replace(" ", "").lower() in low)
     return " ".join(out)
+
+
+def topic_lang(analyzer, text: str) -> str:
+    """Second language guess for topic filtering: detected without its hashtags, because a block
+    of tags in three scripts outweighs a short sentence. A post that is only hashtags (or
+    emoji) is judged on the words of its CamelCase tags instead (#ThailandStartedTheWar);
+    all-lowercase tags are one unsplittable blob that the detector misreads, so they are
+    ignored and a post with nothing else stays undetermined."""
+    lang = analyzer.analyze(TAG_ANY_RE.sub(" ", text or ""))["lang"]
+    if lang.startswith("und"):
+        words = " ".join(w for body in TAG_BODY_RE.findall(text or "")
+                         if not body.islower() for w in CAMEL_RE.findall(body))
+        if words:
+            lang = analyzer.analyze(words)["lang"]
+    return lang
 
 
 def load_topic(path) -> dict:
