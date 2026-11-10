@@ -163,8 +163,18 @@
       "Wyoming"
     ]
   ],
-  "seeds_todo": "Unchecked candidates (verify each handle with one shallow profile visit before adding to seeds): apnews, reuters, cnn, nytimes, washingtonpost, nbcnews, abcnews, foxnews, politico, axios, thehill, npr. Pick a balance across the political spectrum. 'US' is deliberately not a context term: matching is case-insensitive and whole-word, so it would match the pronoun 'us'. Bare 'House' is left out for the same reason ('my house'). State names are context terms except Georgia (also a country) and Washington (also the capital, which is US context anyway but often 'Washington Post'); 'race' only counts with a US context term.",
-  "seeds": [],
+  "seeds_todo": "Checked 2026-11-10 (one shallow visit each; all verified): apnews, reuters, cnn, foxnews, nytimes, washingtonpost, nbcnews, thehill, axios are active seeds. politico is verified but has not posted since 2026-08-24, so it is left out. Fox News is the only right-leaning outlet; consider adding more right-leaning seeds. 'US' is deliberately not a context term: matching is case-insensitive and whole-word, so it would match the pronoun 'us'. Bare 'House' is left out for the same reason ('my house'). State names are context terms except Georgia (also a country) and Washington (often 'Washington Post'). 'race' only counts with a US context term.",
+  "seeds": [
+    "apnews",
+    "reuters",
+    "cnn",
+    "foxnews",
+    "nytimes",
+    "washingtonpost",
+    "nbcnews",
+    "thehill",
+    "axios"
+  ],
   "exclude_users": [
     "meta.ai"
   ]
