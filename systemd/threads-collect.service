@@ -4,6 +4,11 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/Documents/codes/threads-collector/scripts/collect.sh
-# a round takes about an hour; kill it if it hangs
-TimeoutStartSec=3h
+# current topic: US 2026 midterms (live). Thailand-Cambodia is historical and finished.
+Environment=THREADS_TOPICS=topics/us2026_midterms_en.json
+Environment=THREADS_DB=threads_us2026.db
+Environment="THREADS_ARGS=--max-post-pages 100"
+# keep the laptop awake while a round runs
+ExecStart=/usr/bin/systemd-inhibit --what=idle:sleep --who=threads-collector --why="collection round" %h/Documents/codes/threads-collector/scripts/collect.sh
+# a round takes about 2 hours; kill it if it hangs
+TimeoutStartSec=4h
