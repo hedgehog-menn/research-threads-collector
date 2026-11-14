@@ -1001,16 +1001,26 @@ async def snowball(col: Collector, topic: dict, a):
     else:
         since, until = now() - a.revisit_days * 86400, now()
         fresh = now() - a.revisit_hours * 3600
-        urls = [r[0] for r in st.db.execute(
-            """SELECT p.url FROM posts p JOIN post_topics t ON t.post_pk = p.pk AND t.topic = ?
-               LEFT JOIN (SELECT target, MAX(started_at) last FROM visits
-                          WHERE kind = 'post' AND status = 'ok' GROUP BY target) v
-                      ON v.target = p.url
-               WHERE t.on_topic = 1 AND p.found_as = 'result' AND p.url IS NOT NULL
-                 AND p.reply_count > 0 AND p.taken_at BETWEEN ? AND ?
-                 AND (v.last IS NULL OR v.last < ?)
-               ORDER BY v.last IS NOT NULL, p.reply_count DESC LIMIT ?""",
-            (name, since, until, fresh, a.max_post_pages))]
+        # Part of the budget re-opens already-opened posts (most replies first), so the
+        # same threads get repeat snapshots; the rest (and any unused re-open slots) go
+        # to never-opened posts. Without this, new posts always crowd out re-opens.
+        def pick(opened, limit):
+            if limit <= 0:
+                return []
+            rows = st.db.execute(
+                f"""SELECT p.url FROM posts p JOIN post_topics t ON t.post_pk = p.pk AND t.topic = ?
+                   LEFT JOIN (SELECT target, MAX(started_at) last FROM visits
+                              WHERE kind = 'post' AND status = 'ok' GROUP BY target) v
+                          ON v.target = p.url
+                   WHERE t.on_topic = 1 AND p.found_as = 'result' AND p.url IS NOT NULL
+                     AND p.reply_count > 0 AND p.taken_at BETWEEN ? AND ?
+                     AND {"v.last < ?" if opened else "v.last IS NULL"}
+                   ORDER BY p.reply_count DESC LIMIT ?""",
+                (name, since, until, *([fresh] if opened else []), limit)).fetchall()
+            return [r[0] for r in rows]
+        reopen = pick(True, round(a.max_post_pages * a.reopen_share))
+        urls = reopen + pick(False, a.max_post_pages - len(reopen))
+        print(f"re-opened: {len(reopen)}, never opened: {len(urls) - len(reopen)}")
         post_scrolls = a.post_scrolls or LIVE_POST_SCROLLS
     print(f"post pages: {len(urls)} ({post_scrolls} scrolls each)")
     replies_of = dict(st.db.execute(
@@ -1118,6 +1128,9 @@ def build_args():
     p.add_argument("--revisit-days", type=int, default=14, help="re-open post pages of on-topic posts up to this old")
     p.add_argument("--revisit-hours", type=int, default=20, help="don't re-open a post page more often than this")
     p.add_argument("--profile-revisit-days", type=int, default=7)
+    p.add_argument("--reopen-share", type=float, default=0.5,
+                   help="live topics: share of --max-post-pages used to re-open already-opened "
+                        "posts (most replies first); unused slots go to never-opened posts")
     p = sub.add_parser("tag", help="tag posts on/off-topic by the topic's keywords"); p.add_argument("topic")
     sub.add_parser("stats")
     sub.add_parser("reparse", help="re-derive post columns from stored raw_json")
